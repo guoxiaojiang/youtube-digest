@@ -4,7 +4,7 @@
  * This is the "brain" of the extension. It runs in the background and handles:
  * 1. Opening the side panel when the user clicks the extension icon
  * 2. Fetching YouTube transcripts via Supadata API
- * 3. Calling DeepSeek to analyze the transcript
+ * 3. Calling the AI provider (TokenDance) to analyze the transcript
  * 4. Sending results back to the side panel
  *
  * Think of it like a backend server — it does the heavy lifting
@@ -77,11 +77,13 @@ async function requestAiCompletion({
   maxTokens,
   temperature,
   responseFormat,
+  idleTimeoutMs,
+  hardTimeoutMs,
 }) {
   const settings = await getSettings();
   if (!settings.aiApiKey) {
     const error = new Error(
-      "DeepSeek API key not configured. Open YouTube Digest Settings.",
+      "TokenDance API key not configured. Open YouTube Digest Settings.",
     );
     error.code = "NO_AI_KEY";
     throw error;
@@ -95,8 +97,9 @@ async function requestAiCompletion({
   if (responseFormat) {
     body.response_format = responseFormat;
   }
-  // Product features need bounded, predictable latency rather than reasoning traces.
-  body.thinking = { type: "disabled" };
+
+  const idleMs = typeof idleTimeoutMs === "number" ? idleTimeoutMs : AI_PROVIDER_IDLE_TIMEOUT_MS;
+  const hardMs = typeof hardTimeoutMs === "number" ? hardTimeoutMs : AI_PROVIDER_HARD_TIMEOUT_MS;
 
   const controller = new AbortController();
   let timeoutKind = "";
@@ -109,16 +112,10 @@ async function requestAiCompletion({
   };
   const resetIdleTimeout = () => {
     clearTimeout(idleTimeoutId);
-    idleTimeoutId = setTimeout(
-      () => abortForTimeout("idle"),
-      AI_PROVIDER_IDLE_TIMEOUT_MS,
-    );
+    idleTimeoutId = setTimeout(() => abortForTimeout("idle"), idleMs);
   };
 
-  hardTimeoutId = setTimeout(
-    () => abortForTimeout("hard"),
-    AI_PROVIDER_HARD_TIMEOUT_MS,
-  );
+  hardTimeoutId = setTimeout(() => abortForTimeout("hard"), hardMs);
   resetIdleTimeout();
   try {
     const response = await fetch(
@@ -133,7 +130,7 @@ async function requestAiCompletion({
         signal: controller.signal,
       },
     );
-    // Receiving headers proves DeepSeek is still making progress. DeepSeek
+    // Receiving headers proves the AI provider is still making progress. It
     // may then send blank-line body chunks while a non-streaming request queues.
     resetIdleTimeout();
 
@@ -143,7 +140,7 @@ async function requestAiCompletion({
       const error = new Error(
         errorData.error?.message ||
           errorData.message ||
-          `DeepSeek error: ${response.status}`,
+          `AI error: ${response.status}`,
       );
       error.status = response.status;
       throw error;
@@ -151,7 +148,7 @@ async function requestAiCompletion({
 
     const text = data.choices?.[0]?.message?.content;
     if (typeof text !== "string" || !text.trim()) {
-      const error = new Error("DeepSeek returned an empty response.");
+      const error = new Error("AI returned an empty response.");
       error.code = "EMPTY_AI_RESPONSE";
       throw error;
     }
@@ -160,14 +157,14 @@ async function requestAiCompletion({
   } catch (error) {
     if (timeoutKind === "idle") {
       const timeoutError = new Error(
-        "DeepSeek request was inactive for 50 seconds. Please Retry.",
+        `AI request was inactive for ${Math.round(idleMs / 1000)} seconds. Please Retry.`,
       );
       timeoutError.code = "AI_IDLE_TIMEOUT";
       throw timeoutError;
     }
     if (timeoutKind === "hard") {
       const timeoutError = new Error(
-        "DeepSeek request exceeded the 120-second limit. Please Retry.",
+        `AI request exceeded the ${Math.round(hardMs / 1000)}-second limit. Please Retry.`,
       );
       timeoutError.code = "AI_HARD_TIMEOUT";
       throw timeoutError;
@@ -188,13 +185,13 @@ async function readBoundedAiResponse(response, onActivity) {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      // Every received chunk is activity, including DeepSeek's blank lines.
+      // Every received chunk is activity, including blank-line chunks.
       onActivity();
       const byteLength = value?.byteLength ?? 0;
       responseBytes += byteLength;
       if (responseBytes > AI_PROVIDER_MAX_RESPONSE_BYTES) {
         await reader.cancel?.().catch(() => {});
-        const error = new Error("DeepSeek response exceeded the 2 MiB limit.");
+        const error = new Error("AI response exceeded the 2 MiB limit.");
         error.code = "AI_RESPONSE_TOO_LARGE";
         throw error;
       }
@@ -211,7 +208,7 @@ async function readBoundedAiResponse(response, onActivity) {
     onActivity();
     const byteLength = new TextEncoder().encode(responseText).byteLength;
     if (byteLength > AI_PROVIDER_MAX_RESPONSE_BYTES) {
-      const error = new Error("DeepSeek response exceeded the 2 MiB limit.");
+      const error = new Error("AI response exceeded the 2 MiB limit.");
       error.code = "AI_RESPONSE_TOO_LARGE";
       throw error;
     }
@@ -291,6 +288,19 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
   }
 });
 
+// When a tab closes, remove any tab-scoped learning state (translations and
+// vocabulary) that the side panel stored in chrome.storage.session.
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  try {
+    const all = await chrome.storage.session.get(null);
+    const prefix = `ytd_tab_learning_state:${tabId}:`;
+    const keys = Object.keys(all).filter((k) => k.startsWith(prefix));
+    if (keys.length) await chrome.storage.session.remove(keys);
+  } catch (e) {
+    // Session storage may be unavailable in some environments — ignore.
+  }
+});
+
 // ============================================================
 // MESSAGE HANDLING
 // ============================================================
@@ -323,7 +333,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.action === "explainSelection") {
-    // Explain selected text using DeepSeek.
+    // Explain selected text using the AI provider.
     handleExplainSelection(
       message.selectedText,
       message.transcriptContext,
@@ -370,7 +380,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  // Translation: send content to DeepSeek.
+  // Translation: send content to the AI provider.
   if (message.action === "translateContent") {
     handleTranslateContent(
       message.content,
@@ -695,7 +705,7 @@ async function handleFetchTranscript(videoId) {
           // Plain text without timestamps (for display/export)
           transcriptTextPlain += cleanText + " ";
 
-          // Timestamped text for DeepSeek (format: [MM:SS] text)
+          // Timestamped text for the AI (format: [MM:SS] text)
           // This allows the model to reference actual transcript positions.
           transcriptTextTimestamped += `[${timestamp}] ${cleanText}\n`;
         }
@@ -848,7 +858,7 @@ function parseLooseJson(text) {
 // ============================================================
 
 /**
- * Sends the transcript to DeepSeek for analysis.
+ * Sends the transcript to the AI provider for analysis.
  *
  * The prompt asks the model to produce chapters covering the whole video
  * and 3-5 key quotes with timestamps.
@@ -871,7 +881,7 @@ async function handleAnalyzeTranscript(
       return {
         success: false,
         error: "NO_AI_KEY",
-        message: "DeepSeek API key not configured. Open YouTube Digest Settings.",
+        message: "TokenDance API key not configured. Open YouTube Digest Settings.",
       };
     }
 
@@ -952,14 +962,14 @@ async function handleAnalyzeTranscript(
       return {
         success: false,
         error: "INVALID_AI_KEY",
-        message: "DeepSeek rejected the API key.",
+        message: "TokenDance rejected the API key.",
       };
     }
     if (error.status === 429) {
       return {
         success: false,
         error: "RATE_LIMITED",
-        message: "DeepSeek rate-limited this request. Try again shortly.",
+        message: "TokenDance rate-limited this request. Try again shortly.",
       };
     }
     return {
@@ -973,7 +983,7 @@ async function handleAnalyzeTranscript(
  * Validates all timestamps in the analysis and fixes any that exceed video duration.
  * This is a safety net to prevent hallucinated timestamps from reaching the UI.
  *
- * @param {Object} analysis - The parsed analysis from DeepSeek
+ * @param {Object} analysis - The parsed analysis from the AI provider
  * @param {number} maxSeconds - Maximum valid timestamp in seconds
  * @returns {Object} - Analysis with validated timestamps
  */
@@ -1067,7 +1077,7 @@ async function handleGetVideoInfo(tabId) {
 // ============================================================
 
 /**
- * Explains selected text using DeepSeek.
+ * Explains selected text using the AI provider.
  * Provides context, definitions, and clarification for complex terms.
  *
  * @param {string} selectedText - The text the user selected
@@ -1183,7 +1193,7 @@ async function handleSaveNote(
       }
     }
 
-    // Clean up the text with DeepSeek.
+    // Clean up the text with the AI provider.
     const cleanedText = await cleanupNoteText(
       matchedLine.text,
       beforeLine,
@@ -1232,7 +1242,7 @@ async function handleSaveNote(
 }
 
 /**
- * Cleans up transcript lines using DeepSeek.
+ * Cleans up transcript lines using the AI provider.
  * Takes the target line plus buffer sentences (1 before, 1 after).
  * Uses JSON output to prevent any preambles from appearing.
  */
@@ -1371,7 +1381,7 @@ async function handleExplainSelection(
       return {
         success: false,
         error: "NO_AI_KEY",
-        message: "DeepSeek API key not configured.",
+        message: "TokenDance API key not configured.",
       };
     }
 
@@ -1510,7 +1520,7 @@ function normalizeTranslatedSegmentBatch(parsed, sourceSegments) {
 }
 
 /**
- * Translates content using DeepSeek.
+ * Translates content using the AI provider.
  * @param {Object} content - JSON object containing semantic transcript segments
  * @param {string} contentType - Must be 'transcriptBatch'
  * @param {string} targetLanguage - 'zh' for Simplified Chinese
@@ -1539,7 +1549,7 @@ async function handleTranslateContent(
 
     const settings = await getSettings();
     if (!settings.aiApiKey) {
-      return { success: false, error: "DeepSeek API key not configured" };
+      return { success: false, error: "TokenDance API key not configured" };
     }
 
     const sourceSegments = validateTranscriptBatchRequest(content);
@@ -1566,7 +1576,7 @@ async function handleTranslateContent(
       translationOptions,
     );
 
-    // DeepSeek JSON mode can rarely return an empty content string. The prompt
+    // The provider's JSON mode can rarely return an empty content string. The prompt
     // already requires JSON, so retry once without response_format.
     if (!result.success && result.code === "EMPTY_AI_RESPONSE") {
       result = await callAiTranslation(systemPrompt, userContent, {
@@ -1592,7 +1602,7 @@ async function handleTranslateContent(
 }
 
 /**
- * Makes a single DeepSeek call for translation.
+ * Makes a single AI call for translation.
  * Uses temperature 0.3 for consistent, predictable translations.
  *
  * @param {string} systemPrompt - The system-level instructions

@@ -9,7 +9,7 @@ const YTD_OPTIONS = (() => {
       languageGroupLabel: "Interface language",
       heading: "Bring your own API keys",
       lede:
-        "Keys stay in this Chrome profile and are sent only to Supadata and DeepSeek. This open-source extension has no developer server or analytics.",
+        "Keys stay in this Chrome profile and are sent only to Supadata and TokenDance. This open-source extension has no developer server or analytics.",
       transcriptProvider: "Transcript provider",
       supadataApiKeyLabel: "Supadata API key",
       supadataHelp: "Used to fetch timestamped YouTube subtitles. ",
@@ -19,13 +19,13 @@ const YTD_OPTIONS = (() => {
       aiProvider: "AI provider",
       providerSummaryLabel: "Supported AI provider",
       providerBadge: "Supported in this version",
-      deepseekApiKeyLabel: "DeepSeek API key",
+      deepseekApiKeyLabel: "TokenDance API key",
       deepseekHelp:
-        "YouTube Digest uses DeepSeek V4 Flash for overviews, explanations, translation, and note polishing. ",
-      deepseekLink: "Create a DeepSeek API key",
+        "YouTube Digest uses DeepSeek V4 Flash (0731) via TokenDance for overviews, explanations, translation, and note polishing. ",
+      deepseekLink: "Create a TokenDance API key",
       deepseekHelpSuffix: ".",
       privacyNote:
-        "When you use AI features, DeepSeek receives the video transcript and relevant video context. Review DeepSeek's terms and pricing before saving.",
+        "When you use AI features, TokenDance receives the video transcript and relevant video context. Review TokenDance's terms and pricing before saving.",
       saveSettings: "Save settings",
       localRemix: "Local remix",
       customizationTitle: "Want to use another AI model?",
@@ -55,10 +55,10 @@ const YTD_OPTIONS = (() => {
       footer:
         'Read <a href="PRIVACY.md" target="_blank">PRIVACY.md</a> in the repository for the complete data-flow description.',
       migrationWarning:
-        "Custom provider settings were removed safely. Your Supadata key was kept, but the AI key was cleared. Enter a DeepSeek API key to continue.",
+        "Custom provider settings were removed safely. Your Supadata key was kept, but the AI key was cleared. Enter a TokenDance API key to continue.",
       saving: "Saving…",
       addSupadataKey: "Add a Supadata API key.",
-      addDeepseekKey: "Add a DeepSeek API key.",
+      addDeepseekKey: "Add a TokenDance API key.",
       saved: "Saved. Reopen YouTube Digest to use these settings.",
       saveFailed: "Could not save settings. Please try again.",
       copying: "Copying…",
@@ -79,7 +79,7 @@ const YTD_OPTIONS = (() => {
       languageGroupLabel: "界面语言",
       heading: "使用你自己的 API 密钥",
       lede:
-        "密钥仅保存在当前 Chrome 个人资料中，只会发送给 Supadata 和 DeepSeek。本开源扩展没有开发者服务器，也不使用分析服务。",
+        "密钥仅保存在当前 Chrome 个人资料中，只会发送给 Supadata 和 TokenDance。本开源扩展没有开发者服务器，也不使用分析服务。",
       transcriptProvider: "字幕服务",
       supadataApiKeyLabel: "Supadata API 密钥",
       supadataHelp: "用于获取带时间戳的 YouTube 字幕。",
@@ -88,13 +88,13 @@ const YTD_OPTIONS = (() => {
       aiProvider: "AI 服务",
       providerSummaryLabel: "支持的 AI 服务",
       providerBadge: "当前版本支持",
-      deepseekApiKeyLabel: "DeepSeek API 密钥",
+      deepseekApiKeyLabel: "TokenDance API 密钥",
       deepseekHelp:
-        "YouTube Digest 使用 DeepSeek V4 Flash 生成概览、解释内容、翻译字幕和润色笔记。",
-      deepseekLink: "创建 DeepSeek API 密钥",
+        "YouTube Digest 通过 TokenDance 使用 DeepSeek V4 Flash (0731) 生成概览、解释内容、翻译字幕和润色笔记。",
+      deepseekLink: "创建 TokenDance API 密钥",
       deepseekHelpSuffix: "。",
       privacyNote:
-        "使用 AI 功能时，DeepSeek 会收到视频字幕及相关视频上下文。保存前请查看 DeepSeek 的服务条款和价格。",
+        "使用 AI 功能时，TokenDance 会收到视频字幕及相关视频上下文。保存前请查看 TokenDance 的服务条款和价格。",
       saveSettings: "保存设置",
       localRemix: "本地改造",
       customizationTitle: "想使用其他 AI 模型？",
@@ -123,10 +123,10 @@ const YTD_OPTIONS = (() => {
       footer:
         '完整数据流说明请参阅仓库中的 <a href="PRIVACY.md" target="_blank">PRIVACY.md</a>。',
       migrationWarning:
-        "已安全移除自定义服务设置。Supadata 密钥已保留，AI 密钥已清除。请输入 DeepSeek API 密钥以继续使用。",
+        "已安全移除自定义服务设置。Supadata 密钥已保留，AI 密钥已清除。请输入 TokenDance API 密钥以继续使用。",
       saving: "正在保存…",
       addSupadataKey: "请添加 Supadata API 密钥。",
-      addDeepseekKey: "请添加 DeepSeek API 密钥。",
+      addDeepseekKey: "请添加 TokenDance API 密钥。",
       saved: "已保存。请重新打开 YouTube Digest 以使用这些设置。",
       saveFailed: "无法保存设置，请重试。",
       copying: "正在复制…",

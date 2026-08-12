@@ -31,6 +31,7 @@
       <!-- Tab navigation -->
       <div class="tabs" id="tabsNav" style="display: none">
         <button class="tab active" data-tab="transcript">Transcript</button>
+        <button class="tab" data-tab="vocabulary" id="vocabTab">Vocab</button>
         <button class="tab" data-tab="overview">Overview</button>
         <button class="tab" data-tab="notes">Notes</button>
       </div>
@@ -114,12 +115,39 @@
               </div>
               <div class="transcript-actions">
                 <button class="enhance-btn" id="copyTranscriptBtn">Copy</button>
-                <button class="enhance-btn" id="exportTranscriptBtn">
-                  Export
-                </button>
+                <button class="enhance-btn" id="exportTranscriptBtn">Export</button>
               </div>
             </div>
             <div id="transcriptList"></div>
+          </div>
+        </div>
+
+        <!-- TAB: Vocabulary -->
+        <div class="tab-panel" data-panel="vocabulary">
+          <div class="section vocab-section" id="vocabSection">
+            <div class="section-header">
+              <div class="section-title">Vocabulary</div>
+              <div class="vocab-actions">
+                <button class="enhance-btn" id="findVocabBtn" type="button">Extract vocabulary</button>
+              </div>
+            </div>
+            <div class="vocab-progress" id="vocabProgress" style="display:none">
+              <div class="vocab-progress-bar-track">
+                <div class="vocab-progress-bar-fill" id="vocabProgressFill"></div>
+              </div>
+              <div class="vocab-progress-text" id="vocabProgressText">Processing…</div>
+            </div>
+            <div class="vocab-status" id="vocabStatus"></div>
+            <div id="vocabList">
+              <div class="vocab-cta">
+                <div class="vocab-cta-title">Extract learning words</div>
+                <div class="vocab-cta-desc">
+                  Scan the full transcript, list unfamiliar English words with
+                  a Chinese meaning, and jump to the sentence in the video.
+                </div>
+                <button class="vocab-cta-btn" id="findVocabCtaBtn" type="button">Start extraction</button>
+              </div>
+            </div>
           </div>
         </div>
 

@@ -7,10 +7,10 @@
 var YTD_SETTINGS = (() => {
   const STORAGE_KEY = "ytd_settings";
   const DEFAULTS = Object.freeze({
-    provider: "deepseek",
+    provider: "tokendance",
     aiApiKey: "",
-    aiBaseUrl: "https://api.deepseek.com",
-    aiModel: "deepseek-v4-flash",
+    aiBaseUrl: "https://tokendance.space/gateway/v1",
+    aiModel: "deepseek-v4-flash-0731",
     supadataApiKey: "",
   });
 

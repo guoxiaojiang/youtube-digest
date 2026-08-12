@@ -49,7 +49,7 @@ function loadSidepanelHelpers({
     chrome: {
       runtime: { onMessage: listeners, sendMessage },
       windows: { getCurrent: () => Promise.resolve({ id: 1 }) },
-      tabs: { onUpdated: listeners, onActivated: listeners },
+      tabs: { onUpdated: listeners, onActivated: listeners, onRemoved: listeners },
     },
     YTD_SETTINGS: {},
   };
@@ -60,10 +60,10 @@ function loadSidepanelHelpers({
 
 function loadBackgroundHelpers({
   settings = {
-    provider: "deepseek",
+    provider: "tokendance",
     aiApiKey: "test-key",
-    aiBaseUrl: "https://api.deepseek.com",
-    aiModel: "deepseek-v4-flash",
+    aiBaseUrl: "https://tokendance.space/gateway/v1",
+    aiModel: "deepseek-v4-flash-0731",
   },
   fetchImpl = fetch,
   setTimeoutImpl = () => 0,
@@ -98,7 +98,7 @@ function loadBackgroundHelpers({
         openOptionsPage() {},
         getURL: (resourcePath) => `chrome-extension://test/${resourcePath}`,
       },
-      tabs: { onUpdated: listeners, onActivated: listeners },
+      tabs: { onUpdated: listeners, onActivated: listeners, onRemoved: listeners },
     },
     YTD_SETTINGS: {
       STORAGE_KEY: "ytd_settings",
@@ -329,8 +329,8 @@ test("background rejects unsupported language fallthrough and malformed batches"
   );
 });
 
-test("all AI product requests use DeepSeek non-thinking and JSON behavior", async () => {
-  const deepSeekRequests = [];
+test("all AI product requests use JSON behavior and do not send thinking param", async () => {
+  const aiRequests = [];
   const successfulFetch = (requests) => async (_url, options) => {
     requests.push(JSON.parse(options.body));
     return {
@@ -341,17 +341,17 @@ test("all AI product requests use DeepSeek non-thinking and JSON behavior", asyn
     };
   };
 
-  const deepSeek = loadBackgroundHelpers({
-    fetchImpl: successfulFetch(deepSeekRequests),
+  const helpers = loadBackgroundHelpers({
+    fetchImpl: successfulFetch(aiRequests),
   });
-  const deepSeekResult = await deepSeek.requestAiCompletion({
+  const result = await helpers.requestAiCompletion({
     maxTokens: 128,
     responseFormat: { type: "json_object" },
     messages: [{ role: "user", content: "Hello." }],
   });
-  assert.equal(deepSeekResult.text, "translated");
-  assert.deepEqual(deepSeekRequests[0].thinking, { type: "disabled" });
-  assert.deepEqual(deepSeekRequests[0].response_format, {
+  assert.equal(result.text, "translated");
+  assert.equal(Object.hasOwn(aiRequests[0], "thinking"), false);
+  assert.deepEqual(aiRequests[0].response_format, {
     type: "json_object",
   });
 
@@ -361,6 +361,7 @@ test("all AI product requests use DeepSeek non-thinking and JSON behavior", asyn
     4,
   );
   assert.doesNotMatch(backgroundSource, /disableThinking/);
+  assert.doesNotMatch(backgroundSource, /thinking.*disabled/);
   for (const callPath of [
     "handleAnalyzeTranscript",
     "cleanupNoteText",
@@ -495,7 +496,7 @@ test("provider response reader rejects bodies over 2 MiB", async () => {
   assert.match(result.error, /2 MiB limit/);
 });
 
-test("DeepSeek retries one empty transcript JSON response without response_format", async () => {
+test("AI retries one empty transcript JSON response without response_format", async () => {
   const requests = [];
   const helpers = loadBackgroundHelpers({
     fetchImpl: async (url, options) => {

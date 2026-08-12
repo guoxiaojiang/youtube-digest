@@ -16,6 +16,9 @@ const debugLog = (...args) => {
 
 let currentVideoId = null;
 let currentVideoUrl = null;
+// The tab ID that "owns" the current learning session. Used to scope
+// session storage so two tabs showing the same video stay isolated.
+let currentOwnerTabId = null;
 let currentAnalysis = null;
 let currentTranscript = null;
 let currentTranscriptText = null; // Plain text (for display/export)
@@ -28,6 +31,10 @@ let currentVideoDuration = 0;
 let isAnalysisLoading = false; // Track if analysis is in progress
 let youtubeTabId = null; // Store the YouTube tab ID for reliable messaging
 let errorAction = null;
+
+// --- Vocabulary state ---
+let currentVocabItems = null;
+let isVocabLoading = false;
 
 // --- Translation state ---
 // The public transcript control intentionally supports only the original
@@ -82,6 +89,7 @@ function sendTranslationMessage(message) {
 
 // --- Auto-scroll state (follow video playback in transcript) ---
 let autoScrollEnabled = true; // True = scroll transcript to follow video playback
+let jumpNextHighlightWithoutAnimation = false; // Set when transcript re-renders (tab switch, cache reload) so the first highlight jumps to the current line instantly, no smooth animation.
 let autoScrollInterval = null; // setInterval ID for polling video time
 let lastAutoScrollTime = 0; // Timestamp of last programmatic scroll (ignores scroll events within 1s)
 
@@ -252,6 +260,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // seen this video before (no API calls); fetched fresh otherwise.
     // (This used to force-clear the cache on every click, which silently
     // burned a transcript credit + analysis tokens per click.)
+    // A deliberate Digest-button click is the only path that re-enables
+    // auto-scroll — tab activation and URL changes must not force it.
+    autoScrollEnabled = true;
     checkCurrentTab();
     sendResponse({ success: true });
   }
@@ -408,6 +419,16 @@ function setupEventListeners() {
     setNotesFilter(true);
     loadNotes(null); // Load all notes
   });
+
+  // Vocabulary
+  document.getElementById("findVocabBtn")?.addEventListener("click", () => {
+    triggerVocabulary();
+  });
+  // Delegated handler for the CTA button that lives inside the vocab list,
+  // since the list innerHTML is rebuilt on every state change.
+  document.getElementById("vocabList")?.addEventListener("click", (event) => {
+    if (event.target?.id === "findVocabCtaBtn") triggerVocabulary();
+  });
 }
 
 function setNotesFilter(showAll) {
@@ -461,6 +482,7 @@ async function checkCurrentTab() {
 
     // Store the tab ID for reliable messaging later
     youtubeTabId = tab.id;
+    currentOwnerTabId = tab.id;
 
     const videoId = extractVideoId(tab.url);
 
@@ -554,10 +576,23 @@ async function startDigest(videoId, videoUrl) {
     currentTranscriptLanguage = cached.transcriptLanguage || null;
     isAnalysisLoading = false;
 
-    // Restore semantic-segment translations from persistent storage.
-    if (cached.paragraphCache) {
-      for (const [key, value] of Object.entries(cached.paragraphCache)) {
+    // Restore translations and vocabulary from the tab-scoped session store.
+    // This must happen before renderTranscript() so Chinese/bilingual rows
+    // display immediately without queuing fresh API calls.
+    const session = await loadSessionState(currentOwnerTabId, videoId);
+    if (session) {
+      for (const [key, value] of Object.entries(session.translations || {})) {
         transcriptParagraphCache.set(key, value);
+      }
+      if (Array.isArray(session.vocabItems) && session.vocabItems.length) {
+        currentVocabItems = session.vocabItems;
+        const tab = document.getElementById("vocabTab");
+        if (tab) tab.textContent = `Vocab (${currentVocabItems.length})`;
+        const btn = document.getElementById("findVocabBtn");
+        if (btn) btn.textContent = `Re-extract (${currentVocabItems.length})`;
+        const status = document.getElementById("vocabStatus");
+        if (status) status.textContent = `Done. Extracted ${currentVocabItems.length} words from the full video.`;
+        updateVocabList(currentVocabItems);
       }
     }
 
@@ -568,7 +603,12 @@ async function startDigest(videoId, videoUrl) {
       videoInfo.style.display = "block";
     }
 
-    // Always render transcript first
+    // Always render transcript first. The re-render wipes the previously
+    // highlighted row, so the next tick treats the current playback line as
+    // "newly highlighted". Set the flag so the resulting jump is INSTANT
+    // (no smooth animation) — user should land at the current line but not
+    // see a scroll animation on tab switch.
+    jumpNextHighlightWithoutAnimation = true;
     renderTranscript();
 
     // Render analysis if we have it cached
@@ -597,6 +637,11 @@ async function startDigest(videoId, videoUrl) {
   currentTranscriptTimestamped = null;
   currentTranscriptLanguage = null;
   isAnalysisLoading = false;
+  currentVocabItems = null;
+  isVocabLoading = false;
+  // Clear any leftover session state from a previous video on this tab.
+  clearSessionState(currentOwnerTabId, currentVideoId);
+  resetVocabUI();
 
   if (currentVideoTitle || currentChannelName) {
     const videoInfo = document.getElementById("videoInfo");
@@ -874,28 +919,348 @@ function copyTranscript() {
 }
 
 function exportTranscript() {
-  const transcriptContent = currentTranscriptText || "";
   const videoUrl = `https://youtube.com/watch?v=${currentVideoId}`;
+  const title = escapeHtml(currentVideoTitle || "Untitled");
+  const channel = escapeHtml(currentChannelName || "");
+  const exportDate = new Date().toLocaleDateString(undefined, {
+    year: "numeric", month: "long", day: "numeric",
+  });
 
-  let exportText = "";
-  exportText += `TRANSCRIPT\n`;
-  exportText += `${"=".repeat(60)}\n\n`;
-  exportText += `Title: ${currentVideoTitle || "Unknown"}\n`;
-  exportText += `Channel: ${currentChannelName || "Unknown"}\n`;
-  exportText += `URL: ${videoUrl}\n`;
-  exportText += `\n${"—".repeat(60)}\n\n`;
+  // Build transcript rows from the active display mode (original / zh / bilingual)
+  const segments = getActiveTranscriptSegments();
+  let rowsHtml = "";
+  if (segments.length) {
+    for (const seg of segments) {
+      const mins = Math.floor((seg.start || 0) / 60);
+      const secs = Math.floor((seg.start || 0) % 60);
+      const ts = `${mins}:${String(secs).padStart(2, "0")}`;
+      const tsUrl = `${videoUrl}&t=${seg.start || 0}s`;
+      const orig = escapeHtml(seg.text || "");
+      const zh = transcriptParagraphCache.get(
+        transcriptTranslationCacheKey ? transcriptTranslationCacheKey(seg) : "",
+      );
 
-  if (currentVideoDescription) {
-    exportText += `DESCRIPTION:\n${currentVideoDescription}\n`;
-    exportText += `\n${"—".repeat(60)}\n\n`;
+      if (currentTranscriptMode === "bilingual" && zh) {
+        rowsHtml += `
+          <div class="row bilingual">
+            <a class="ts" href="${tsUrl}" target="_blank">${ts}</a>
+            <div class="lines">
+              <div class="orig">${orig}</div>
+              <div class="zh">${escapeHtml(zh)}</div>
+            </div>
+          </div>`;
+      } else if (currentTranscriptMode === "zh" && zh) {
+        rowsHtml += `
+          <div class="row">
+            <a class="ts" href="${tsUrl}" target="_blank">${ts}</a>
+            <div class="lines"><div class="zh">${escapeHtml(zh)}</div></div>
+          </div>`;
+      } else {
+        rowsHtml += `
+          <div class="row">
+            <a class="ts" href="${tsUrl}" target="_blank">${ts}</a>
+            <div class="lines"><div class="orig">${orig}</div></div>
+          </div>`;
+      }
+    }
+  } else {
+    rowsHtml = `<p style="color:#999">No transcript available.</p>`;
   }
 
-  exportText += `TRANSCRIPT:\n\n${transcriptContent}\n`;
-  exportText += `\n${"—".repeat(60)}\n`;
-  exportText += `Exported by YouTube Digest\n`;
+  // Chapters section (if analysis is available)
+  let chaptersHtml = "";
+  if (currentAnalysis?.chapters?.length) {
+    chaptersHtml = `<section class="chapters">
+      <h2>Chapters</h2>
+      <ol>`;
+    for (const ch of currentAnalysis.chapters) {
+      const tsUrl = `${videoUrl}&t=${ch.timestampSeconds}s`;
+      chaptersHtml += `
+        <li>
+          <a href="${tsUrl}" target="_blank" class="ch-ts">${escapeHtml(ch.timestamp)}</a>
+          <strong>${escapeHtml(ch.title)}</strong>
+          ${ch.summary ? `<span class="ch-summary"> — ${escapeHtml(ch.summary)}</span>` : ""}
+        </li>`;
+    }
+    chaptersHtml += `</ol></section>`;
+  }
 
-  const filename = `${sanitizeFilename(currentVideoTitle)}-transcript.txt`;
-  downloadTextFile(exportText, filename);
+  // Vocabulary section (if available)
+  let vocabHtml = "";
+  if (currentVocabItems?.length) {
+    vocabHtml = `<section class="vocab">
+      <h2>Vocabulary</h2>
+      <table>
+        <thead><tr><th>Word</th><th>中文</th><th>Sentence</th><th>Time</th></tr></thead>
+        <tbody>`;
+    for (const item of currentVocabItems) {
+      const tsUrl = `${videoUrl}&t=${item.timestampSeconds}s`;
+      const highlighted = escapeHtml(item.sentence).replace(
+        new RegExp(`(${escapeHtml(item.word).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`, "gi"),
+        "<mark>$1</mark>",
+      );
+      vocabHtml += `
+        <tr>
+          <td class="vw">${escapeHtml(item.word)}</td>
+          <td class="vzh">${escapeHtml(item.chinese || "")}</td>
+          <td class="vs">${highlighted}</td>
+          <td><a href="${tsUrl}" target="_blank">${escapeHtml(item.timestamp)}</a></td>
+        </tr>`;
+    }
+    vocabHtml += `</tbody></table></section>`;
+  }
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${title}</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --ink: #1a1510;
+    --ink2: #4a4035;
+    --muted: #8a7d70;
+    --accent: #c8674f;
+    --bg: #faf8f5;
+    --rule: #e8e0d5;
+    --zh-ink: #2d4a2d;
+    --font-body: system-ui, "Segoe UI", Helvetica, Arial, sans-serif;
+    --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    --font-zh: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+
+  body {
+    font-family: var(--font-body);
+    font-size: 15px;
+    line-height: 1.7;
+    color: var(--ink);
+    background: var(--bg);
+    padding: 0;
+  }
+
+  /* ── Page layout ── */
+  .page {
+    max-width: 780px;
+    margin: 0 auto;
+    padding: 48px 32px 80px;
+  }
+
+  /* ── Header ── */
+  header {
+    margin-bottom: 40px;
+    padding-bottom: 24px;
+    border-bottom: 2px solid var(--ink);
+  }
+  .label {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 8px;
+  }
+  h1 {
+    font-size: 26px;
+    font-weight: 700;
+    line-height: 1.25;
+    color: var(--ink);
+    margin-bottom: 10px;
+  }
+  .meta {
+    font-size: 13px;
+    color: var(--muted);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0 20px;
+  }
+  .meta a { color: var(--accent); text-decoration: none; }
+  .meta a:hover { text-decoration: underline; }
+
+  /* ── Sections ── */
+  section { margin-top: 44px; }
+  section + section { margin-top: 44px; }
+  h2 {
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.10em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 16px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--rule);
+  }
+
+  /* ── Chapters ── */
+  .chapters ol {
+    list-style: none;
+    counter-reset: ch;
+    padding: 0;
+  }
+  .chapters li {
+    counter-increment: ch;
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--rule);
+    font-size: 14px;
+  }
+  .chapters li::before {
+    content: counter(ch, decimal-leading-zero);
+    font-variant-numeric: tabular-nums;
+    font-size: 11px;
+    color: var(--muted);
+    flex-shrink: 0;
+    width: 22px;
+  }
+  .ch-ts {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--accent);
+    text-decoration: none;
+    flex-shrink: 0;
+  }
+  .ch-ts:hover { text-decoration: underline; }
+  .ch-summary { color: var(--ink2); font-weight: 400; }
+
+  /* ── Transcript rows ── */
+  .transcript .row {
+    display: flex;
+    gap: 16px;
+    padding: 7px 0;
+    border-bottom: 1px solid var(--rule);
+    page-break-inside: avoid;
+  }
+  .ts {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--accent);
+    text-decoration: none;
+    flex-shrink: 0;
+    width: 40px;
+    padding-top: 2px;
+    line-height: 1.7;
+  }
+  .ts:hover { text-decoration: underline; }
+  .lines { flex: 1; min-width: 0; }
+  .orig {
+    font-size: 14.5px;
+    line-height: 1.65;
+    color: var(--ink);
+  }
+  .zh {
+    font-family: var(--font-zh), var(--font-body);
+    font-size: 13.5px;
+    line-height: 1.75;
+    color: var(--zh-ink);
+  }
+  .bilingual .zh { margin-top: 2px; }
+
+  /* ── Vocabulary table ── */
+  .vocab table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13.5px;
+  }
+  .vocab th {
+    text-align: left;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    padding: 6px 8px 6px 0;
+    border-bottom: 1px solid var(--rule);
+  }
+  .vocab td {
+    vertical-align: top;
+    padding: 8px 8px 8px 0;
+    border-bottom: 1px solid var(--rule);
+    line-height: 1.55;
+  }
+  .vw {
+    font-weight: 700;
+    color: var(--accent);
+    white-space: nowrap;
+    padding-right: 12px !important;
+  }
+  .vzh {
+    font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    color: var(--ink2);
+    white-space: nowrap;
+    padding-right: 12px !important;
+  }
+  .vs { color: var(--ink2); }
+  mark {
+    background: transparent;
+    font-weight: 700;
+    color: var(--accent);
+  }
+  .vocab a { color: var(--muted); text-decoration: none; font-family: var(--font-mono); font-size: 11px; }
+  .vocab a:hover { text-decoration: underline; }
+
+  /* ── Footer ── */
+  footer {
+    margin-top: 56px;
+    padding-top: 16px;
+    border-top: 1px solid var(--rule);
+    font-size: 12px;
+    color: var(--muted);
+  }
+  footer a { color: var(--muted); }
+
+  /* ── Print ── */
+  @media print {
+    body { background: #fff; }
+    .page { padding: 0; max-width: 100%; }
+    header { border-bottom-color: #000; }
+    a { color: inherit !important; text-decoration: none !important; }
+    .ts, .ch-ts { color: #555 !important; }
+    .vw { color: #333 !important; }
+    mark { font-weight: 700; }
+    @page { margin: 18mm 20mm; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header>
+    <div class="label">YouTube Digest</div>
+    <h1>${title}</h1>
+    <div class="meta">
+      ${channel ? `<span>${channel}</span>` : ""}
+      <a href="${videoUrl}" target="_blank">${videoUrl}</a>
+      <span>${exportDate}</span>
+    </div>
+  </header>
+
+  ${chaptersHtml}
+
+  <section class="transcript">
+    <h2>Transcript${currentTranscriptMode === "zh" ? " · 中文" : currentTranscriptMode === "bilingual" ? " · Bilingual" : ""}</h2>
+    ${rowsHtml}
+  </section>
+
+  ${vocabHtml}
+
+  <footer>Exported by <a href="https://github.com/zarazhangrui/youtube-digest">YouTube Digest</a></footer>
+
+</div>
+</body>
+</html>`;
+
+  const filename = `${sanitizeFilename(currentVideoTitle)}-transcript.html`;
+  const blob = new Blob([html], { type: "text/html" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 // ============================================================
@@ -976,6 +1341,8 @@ function switchTab(tabName) {
   if (tabName === "overview" && !currentAnalysis && !isAnalysisLoading) {
     triggerAnalysis();
   }
+  // Vocabulary is user-initiated only — the panel shows an Extract button
+  // and does nothing until the user clicks it.
 }
 
 /**
@@ -1029,6 +1396,439 @@ async function triggerAnalysis() {
   }
 
   isAnalysisLoading = false;
+}
+
+// ============================================================
+// VOCABULARY EXTRACTION
+// ============================================================
+
+function resetVocabUI() {
+  const section = document.getElementById("vocabSection");
+  const status = document.getElementById("vocabStatus");
+  const btn = document.getElementById("findVocabBtn");
+  const list = document.getElementById("vocabList");
+  const tab = document.getElementById("vocabTab");
+  const progress = document.getElementById("vocabProgress");
+  const fill = document.getElementById("vocabProgressFill");
+  if (section) section.style.display = "";
+  if (btn) { btn.disabled = false; btn.textContent = "Extract vocabulary"; }
+  if (status) status.textContent = "";
+  if (list) {
+    list.innerHTML = `
+      <div class="vocab-cta">
+        <div class="vocab-cta-title">Extract learning words</div>
+        <div class="vocab-cta-desc">
+          Scan the full transcript, list unfamiliar English words with
+          a Chinese meaning, and jump to the sentence in the video.
+        </div>
+        <button class="vocab-cta-btn" id="findVocabCtaBtn" type="button">Start extraction</button>
+      </div>`;
+  }
+  if (tab) tab.textContent = "Vocab";
+  if (progress) progress.style.display = "none";
+  if (fill) fill.style.width = "0%";
+}
+
+// ============================================================
+// VOCABULARY EXTRACTION (sidepanel-side, streamed by chunk)
+// ============================================================
+// Runs the AI calls directly from the sidepanel instead of the background
+// service worker. This avoids Chrome killing long-running message channels
+// ("The message channel closed before a response was received") when the
+// service worker suspends. Each chunk renders as soon as it lands, so the
+// user sees progressive results.
+
+const VOCAB_CHUNK_SIZE = 5000;
+const VOCAB_MAX_TOKENS = 16000;
+
+function updateVocabProgress({ done, total, running }) {
+  const progress = document.getElementById("vocabProgress");
+  const fill = document.getElementById("vocabProgressFill");
+  const text = document.getElementById("vocabProgressText");
+  const tab = document.getElementById("vocabTab");
+  if (!progress) return;
+  if (!running) {
+    progress.style.display = "none";
+    if (tab) tab.textContent = "Vocab";
+    return;
+  }
+  progress.style.display = "";
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  if (fill) fill.style.width = `${pct}%`;
+  if (text) text.textContent = `Processing chunk ${done} / ${total} · ${pct}%`;
+  if (tab) tab.textContent = `Vocab ${done}/${total}`;
+}
+
+async function triggerVocabulary() {
+  if (isVocabLoading) return;
+  // Already have results — just scroll them into view.
+  if (currentVocabItems && currentVocabItems.length) {
+    const section = document.getElementById("vocabSection");
+    if (section) section.scrollIntoView({ behavior: "smooth", block: "start" });
+    return;
+  }
+  if (!currentTranscriptTimestamped) {
+    const status = document.getElementById("vocabStatus");
+    if (status) status.textContent = "No transcript available.";
+    return;
+  }
+
+  isVocabLoading = true;
+  currentVocabItems = [];
+  const btn = document.getElementById("findVocabBtn");
+  const status = document.getElementById("vocabStatus");
+  if (btn) { btn.disabled = true; btn.textContent = "Extracting…"; }
+  if (status) status.textContent = "";
+
+  const chunks = splitTranscriptForVocab(currentTranscriptTimestamped, VOCAB_CHUNK_SIZE);
+  const perChunkQuota = Math.max(6, Math.ceil(30 / Math.max(1, chunks.length)));
+  const seenWords = new Set();
+
+  updateVocabList([]);
+  updateVocabProgress({ done: 0, total: chunks.length, running: true });
+
+  let settings;
+  try {
+    const stored = await chrome.storage.local.get(YTD_SETTINGS.STORAGE_KEY);
+    settings = YTD_SETTINGS.normalize(stored[YTD_SETTINGS.STORAGE_KEY]);
+    if (!settings.aiApiKey) {
+      if (status) status.textContent = "TokenDance API key not configured. Open Settings.";
+      if (btn) { btn.disabled = false; btn.textContent = "Extract vocabulary"; }
+      updateVocabProgress({ running: false });
+      isVocabLoading = false;
+      return;
+    }
+  } catch (err) {
+    if (status) status.textContent = `Setup error: ${err.message}`;
+    if (btn) { btn.disabled = false; btn.textContent = "Extract vocabulary"; }
+    updateVocabProgress({ running: false });
+    isVocabLoading = false;
+    return;
+  }
+
+  for (let i = 0; i < chunks.length; i++) {
+    let chunkItems = [];
+    try {
+      chunkItems = await extractVocabularyChunkFromSidepanel(
+        chunks[i],
+        currentVideoTitle,
+        perChunkQuota,
+        settings,
+        (item) => {
+          // Stream: item arrived mid-chunk. Add to global list right away.
+          const key = item.word.toLowerCase();
+          if (seenWords.has(key)) return;
+          seenWords.add(key);
+          currentVocabItems.push(item);
+          currentVocabItems.sort((a, b) => a.timestampSeconds - b.timestampSeconds);
+          updateVocabList(currentVocabItems);
+        },
+      );
+    } catch (err) {
+      console.warn(`[YouTube Digest Panel] Vocab chunk ${i} failed:`, err.message);
+    }
+    // Safety net: also handle any items that were only returned in the final
+    // batch (e.g. non-streaming fallback path).
+    for (const item of chunkItems) {
+      const key = item.word.toLowerCase();
+      if (seenWords.has(key)) continue;
+      seenWords.add(key);
+      currentVocabItems.push(item);
+    }
+    currentVocabItems.sort((a, b) => a.timestampSeconds - b.timestampSeconds);
+    updateVocabList(currentVocabItems);
+    updateVocabProgress({ done: i + 1, total: chunks.length, running: true });
+  }
+
+  updateVocabProgress({ running: false });
+  if (currentVocabItems.length === 0) {
+    if (status) status.textContent = "No vocabulary items were returned. Try again.";
+  } else {
+    if (status) status.textContent = `Done. Extracted ${currentVocabItems.length} words from the full video.`;
+  }
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = currentVocabItems.length
+      ? `Re-extract (${currentVocabItems.length})`
+      : "Extract vocabulary";
+  }
+  const tab = document.getElementById("vocabTab");
+  if (tab) {
+    tab.textContent = currentVocabItems.length
+      ? `Vocab (${currentVocabItems.length})`
+      : "Vocab";
+  }
+  // Persist the final vocabulary list so it survives tab switches.
+  saveSessionState();
+  isVocabLoading = false;
+}
+
+function splitTranscriptForVocab(transcriptText, maxChars) {
+  const lines = String(transcriptText || "").split("\n");
+  const chunks = [];
+  let current = "";
+  for (const line of lines) {
+    if (!line) continue;
+    if (current.length + line.length + 1 > maxChars && current) {
+      chunks.push(current);
+      current = line;
+    } else {
+      current = current ? current + "\n" + line : line;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks.length ? chunks : [""];
+}
+
+async function extractVocabularyChunkFromSidepanel(chunkText, videoTitle, maxItems, settings, onItem) {
+  const systemPrompt = `You are a vocabulary extraction assistant for Chinese-speaking English learners. You will receive a timestamped English video transcript.
+
+Your task:
+1. Identify words or short phrases (1–3 words) that a learner at B1–B2 level might find unfamiliar or worth studying.
+2. For each vocabulary item, find ONE specific sentence in the transcript that contains the word.
+3. Copy the full sentence exactly as it appears in the transcript.
+4. Use the timestamp of the line where the sentence begins (the [MM:SS] marker immediately before the sentence).
+5. Provide a concise Simplified Chinese meaning for the word IN THE CONTEXT of the sentence (2–8 汉字, no pinyin, no English).
+
+Selection criteria:
+- Prefer low-frequency academic, technical, or idiomatic vocabulary over common everyday words.
+- Do not include: articles, prepositions, pronouns, or basic high-frequency verbs (be, have, do, go, make, get).
+- Include at most ${maxItems} items, each with a different vocabulary word.
+
+Do not use any chain-of-thought or reasoning traces. Output only the final JSON.
+
+Return a JSON object with this structure:
+{"items":[{"word":"...","chinese":"...","sentence":"...","timestampSeconds":0,"timestamp":"0:00"},...]}
+
+Field rules:
+- word: the English vocabulary item.
+- chinese: concise Simplified Chinese meaning of the word in this sentence's context.
+- sentence: a complete sentence from the transcript; the word must appear verbatim in it.
+- timestampSeconds: non-negative integer (seconds from video start).
+- timestamp: "M:SS" or "MM:SS" format, matching timestampSeconds.`;
+
+  const userPrompt = `Video: ${videoTitle || "Unknown"}\n\nTranscript:\n${chunkText}`;
+  const mergedPrompt = `${systemPrompt}\n\n---\n\n${userPrompt}`;
+
+  const body = {
+    model: settings.aiModel,
+    max_tokens: VOCAB_MAX_TOKENS,
+    temperature: 0.3,
+    stream: true,
+    // Vocabulary-only knobs. Non-vocab callers of this provider must not
+    // inherit these: reasoning is disabled here to speed up a task that
+    // does not need chain-of-thought, and the SSE stream lets us render
+    // partial items as they arrive.
+    enable_thinking: false,
+    thinking: { type: "disabled" },
+    messages: [{ role: "user", content: mergedPrompt }],
+  };
+
+  const response = await fetch(YTD_SETTINGS.chatCompletionsUrl(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${settings.aiApiKey}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => "");
+    throw new Error(`HTTP ${response.status}: ${errText.slice(0, 200)}`);
+  }
+
+  // Stream the SSE response, accumulating content deltas. As full item
+  // objects appear inside "items":[...], emit them via onItem so the UI
+  // renders live without waiting for the whole chunk to complete.
+  const reader = response.body?.getReader?.();
+  const decoder = new TextDecoder();
+  let fullText = "";
+  let sseBuffer = "";
+
+  const localSeen = new Set();
+  const items = [];
+  let emittedCharPos = 0;
+
+  const tryEmitItems = () => {
+    // Find "items" : [ ... and start scanning object literals from there.
+    const itemsMatch = fullText.match(/"items"\s*:\s*\[/);
+    if (!itemsMatch) return;
+    const arrStart = itemsMatch.index + itemsMatch[0].length;
+    let scan = Math.max(emittedCharPos, arrStart);
+
+    while (scan < fullText.length) {
+      // Skip whitespace and commas.
+      while (scan < fullText.length && /[\s,]/.test(fullText[scan])) scan++;
+      if (scan >= fullText.length) break;
+      // Stop if we've reached array end.
+      if (fullText[scan] === "]") break;
+      if (fullText[scan] !== "{") { scan++; continue; }
+
+      // Walk forward to find the matching closing brace, respecting strings.
+      let depth = 0;
+      let inString = false;
+      let escape = false;
+      let end = -1;
+      for (let i = scan; i < fullText.length; i++) {
+        const c = fullText[i];
+        if (escape) { escape = false; continue; }
+        if (c === "\\") { escape = true; continue; }
+        if (c === "\"") { inString = !inString; continue; }
+        if (inString) continue;
+        if (c === "{") depth++;
+        else if (c === "}") {
+          depth--;
+          if (depth === 0) { end = i; break; }
+        }
+      }
+      if (end === -1) break; // object not yet complete — wait for more data
+
+      const objText = fullText.slice(scan, end + 1);
+      try {
+        const raw = JSON.parse(objText);
+        const parsed = normalizeVocabItem(raw, localSeen);
+        if (parsed) {
+          items.push(parsed);
+          if (typeof onItem === "function") onItem(parsed);
+        }
+      } catch {
+        // Malformed object literal — skip it.
+      }
+      scan = end + 1;
+      emittedCharPos = scan;
+      if (items.length >= maxItems) break;
+    }
+  };
+
+  if (reader) {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      sseBuffer += decoder.decode(value, { stream: true });
+      // SSE frames are separated by blank lines; each "data: {...}" line is one JSON delta.
+      const frames = sseBuffer.split("\n\n");
+      sseBuffer = frames.pop() || "";
+      for (const frame of frames) {
+        for (const line of frame.split("\n")) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("data:")) continue;
+          const payload = trimmed.slice(5).trim();
+          if (!payload || payload === "[DONE]") continue;
+          try {
+            const evt = JSON.parse(payload);
+            const delta = evt.choices?.[0]?.delta?.content;
+            if (typeof delta === "string" && delta) {
+              fullText += delta;
+            }
+          } catch { /* ignore malformed frame */ }
+        }
+      }
+      tryEmitItems();
+      if (items.length >= maxItems) break;
+    }
+  } else {
+    // Fallback: non-streaming environment. Read whole body as JSON.
+    const data = await response.json();
+    const text = data.choices?.[0]?.message?.content || "";
+    if (text.trim()) {
+      fullText = text;
+      tryEmitItems();
+    }
+  }
+
+  return items;
+}
+
+function normalizeVocabItem(item, localSeen) {
+  const word = typeof item?.word === "string" ? item.word.trim().slice(0, 100) : "";
+  const chinese = typeof item?.chinese === "string" ? item.chinese.trim().slice(0, 100) : "";
+  const sentence = typeof item?.sentence === "string" ? item.sentence.trim().slice(0, 1000) : "";
+  const seconds = Number(item?.timestampSeconds);
+  const timestamp = typeof item?.timestamp === "string" ? item.timestamp.trim() : "";
+  if (!word || !sentence || !Number.isFinite(seconds) || seconds < 0) return null;
+  if (localSeen.has(word.toLowerCase())) return null;
+  localSeen.add(word.toLowerCase());
+  const safeSeconds = Math.floor(seconds);
+  const mins = Math.floor(safeSeconds / 60);
+  const secs = safeSeconds % 60;
+  return {
+    word,
+    chinese,
+    sentence,
+    timestampSeconds: safeSeconds,
+    timestamp: timestamp || `${mins}:${String(secs).padStart(2, "0")}`,
+  };
+}
+
+function parseVocabJson(text) {
+  let cleaned = (text || "").trim();
+  if (cleaned.startsWith("```")) {
+    cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "");
+  }
+  const firstBrace = cleaned.indexOf("{");
+  const lastBrace = cleaned.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    cleaned = cleaned.slice(firstBrace, lastBrace + 1);
+  }
+  try {
+    return JSON.parse(cleaned);
+  } catch (e) {
+    return JSON.parse(cleaned.replace(/,(\s*[}\]])/g, "$1"));
+  }
+}
+
+function updateVocabList(items) {
+  const list = document.getElementById("vocabList");
+  if (!list) return;
+
+  if (!items || items.length === 0) {
+    if (isVocabLoading) {
+      list.innerHTML = '<div class="vocab-empty">Waiting for the first chunk…</div>';
+    } else {
+      list.innerHTML = `
+        <div class="vocab-cta">
+          <div class="vocab-cta-title">Extract learning words</div>
+          <div class="vocab-cta-desc">
+            Scan the full transcript, list unfamiliar English words with
+            a Chinese meaning, and jump to the sentence in the video.
+          </div>
+          <button class="vocab-cta-btn" id="findVocabCtaBtn" type="button">Start extraction</button>
+        </div>`;
+    }
+    return;
+  }
+
+  list.innerHTML = "";
+  items.forEach((item) => {
+    const div = document.createElement("div");
+    div.className = "vocab-item";
+    div.dataset.seconds = item.timestampSeconds;
+
+    const escapedSentence = escapeHtml(item.sentence);
+    const escapedWord = escapeHtml(item.word);
+    const highlightedSentence = escapedSentence.replace(
+      new RegExp(`(${escapedWord.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`, "gi"),
+      '<mark class="vocab-highlight">$1</mark>',
+    );
+
+    const chineseHtml = item.chinese
+      ? `<span class="vocab-chinese">${escapeHtml(item.chinese)}</span>`
+      : "";
+
+    div.innerHTML = `
+      <div class="vocab-header">
+        <span class="vocab-word">${escapedWord}</span>
+        ${chineseHtml}
+      </div>
+      <div class="vocab-sentence">${highlightedSentence}</div>
+      <div class="vocab-meta">
+        <span class="vocab-timestamp">${escapeHtml(item.timestamp)}</span>
+      </div>
+    `;
+    div.addEventListener("click", () => seekTo(item.timestampSeconds));
+    list.appendChild(div);
+  });
 }
 
 // ============================================================
@@ -1342,23 +2142,14 @@ async function saveToCache(videoId) {
   if (!videoId || !currentTranscript) return;
 
   try {
-    // Persist semantic-segment translations for this video.
-    const paragraphCacheForVideo = {};
-    for (const [key, value] of transcriptParagraphCache.entries()) {
-      if (key.startsWith(`${videoId}:`)) {
-        paragraphCacheForVideo[key] = value;
-      }
-    }
-
     const cacheData = {
-      analysis: currentAnalysis, // May be null if not yet analyzed
+      analysis: currentAnalysis,
       transcript: currentTranscript,
       transcriptText: currentTranscriptText,
       transcriptTimestamped: currentTranscriptTimestamped,
       transcriptLanguage: currentTranscriptLanguage,
       videoTitle: currentVideoTitle,
       channelName: currentChannelName,
-      paragraphCache: paragraphCacheForVideo,
       timestamp: Date.now(),
     };
 
@@ -1452,6 +2243,74 @@ async function updateCache() {
   if (currentVideoId) {
     await saveToCache(currentVideoId);
   }
+}
+
+// ============================================================
+// SESSION STATE  (translations + vocabulary, tab-scoped)
+// ============================================================
+// Stores the learning results that are expensive to recreate (translated
+// segments and extracted vocabulary) in chrome.storage.session so they
+// survive side-panel reloads and tab-switching but are never kept across
+// a browser restart. The background's tabs.onRemoved listener removes
+// records as soon as the owning YouTube tab closes.
+
+const SESSION_STATE_VERSION = 1;
+
+function sessionStateKey(tabId, videoId) {
+  return `ytd_tab_learning_state:${tabId}:${videoId}`;
+}
+
+// Debounce handle to coalesce rapid writes (streaming vocab, batched translations).
+let sessionSaveTimer = null;
+
+async function saveSessionState() {
+  if (!currentOwnerTabId || !currentVideoId) return;
+  clearTimeout(sessionSaveTimer);
+  sessionSaveTimer = setTimeout(async () => {
+    try {
+      const translations = {};
+      for (const [key, value] of transcriptParagraphCache.entries()) {
+        if (key.startsWith(`${currentVideoId}:`)) translations[key] = value;
+      }
+      const record = {
+        version: SESSION_STATE_VERSION,
+        tabId: currentOwnerTabId,
+        videoId: currentVideoId,
+        translations,
+        vocabItems: currentVocabItems || [],
+      };
+      const key = sessionStateKey(currentOwnerTabId, currentVideoId);
+      await chrome.storage.session.set({ [key]: record });
+    } catch (err) {
+      console.warn("[YouTube Digest] Session save failed:", err.message);
+    }
+  }, 300);
+}
+
+async function loadSessionState(tabId, videoId) {
+  if (!tabId || !videoId) return null;
+  try {
+    const key = sessionStateKey(tabId, videoId);
+    const result = await chrome.storage.session.get(key);
+    const record = result[key];
+    if (
+      !record ||
+      record.version !== SESSION_STATE_VERSION ||
+      record.tabId !== tabId ||
+      record.videoId !== videoId
+    ) return null;
+    return record;
+  } catch (err) {
+    console.warn("[YouTube Digest] Session load failed:", err.message);
+    return null;
+  }
+}
+
+async function clearSessionState(tabId, videoId) {
+  if (!tabId || !videoId) return;
+  try {
+    await chrome.storage.session.remove(sessionStateKey(tabId, videoId));
+  } catch { /* ignore */ }
 }
 
 // ============================================================
@@ -1602,8 +2461,13 @@ function startPlaybackTracking() {
   // Don't restart if already tracking (preserves user's auto-scroll state)
   if (autoScrollInterval) return;
 
-  autoScrollEnabled = true;
-  document.getElementById("followPlaybackBtn").style.display = "none";
+  // Do NOT reset autoScrollEnabled here — the caller (startDigest or
+  // Follow-playback button) is responsible for setting it to true when
+  // appropriate. Switching back to the Transcript tab must not re-enable
+  // auto-scroll if the user had already scrolled away.
+
+  document.getElementById("followPlaybackBtn").style.display =
+    autoScrollEnabled ? "none" : "block";
 
   // Poll video time every 500ms
   autoScrollInterval = setInterval(() => playbackTrackingTick(), 500);
@@ -1623,7 +2487,6 @@ function stopPlaybackTracking() {
     clearInterval(autoScrollInterval);
     autoScrollInterval = null;
   }
-  autoScrollEnabled = true; // Reset for next time
   lastAutoScrollTime = 0;
   document.getElementById("followPlaybackBtn").style.display = "none";
 
@@ -1709,10 +2572,15 @@ function highlightActiveEntry(currentSeconds) {
   entries.forEach((e) => e.classList.remove("active-playback"));
   activeEntry.classList.add("active-playback");
 
-  // Only scroll if auto-scroll is enabled
+  // Only scroll if auto-scroll is enabled.
   if (autoScrollEnabled) {
     lastAutoScrollTime = Date.now();
-    activeEntry.scrollIntoView({ behavior: "smooth", block: "center" });
+    // On re-render (tab switch / cache reload), jump instantly to the current
+    // playback row without the smooth animation. After the first jump, revert
+    // to smooth follow-along.
+    const scrollBehavior = jumpNextHighlightWithoutAnimation ? "instant" : "smooth";
+    activeEntry.scrollIntoView({ behavior: scrollBehavior, block: "center" });
+    jumpNextHighlightWithoutAnimation = false;
   }
 }
 
@@ -1881,6 +2749,7 @@ function updateTranslatedRow(segment, index, alignedItem, generation) {
       transcriptTranslationCacheKey(segment),
       alignedItem.text,
     );
+    saveSessionState();
   }
 
   const copy = row.querySelector(".transcript-copy");

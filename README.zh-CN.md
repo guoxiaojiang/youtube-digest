@@ -51,7 +51,7 @@ YouTube Digest 是一个需要自行提供 API Key 的开源项目，通过 GitH
 YouTube Digest 需要你在自己的服务账号中准备两个 Key：
 
 1. **Supadata API Key**，用于获取 YouTube 字幕。
-2. **DeepSeek API Key**，用于生成概览、讲解内容、翻译和自动润色笔记。
+2. **TokenDance API Key**，用于生成概览、讲解内容、翻译和自动润色笔记。
 
 ### 获取 Supadata API Key
 
@@ -63,27 +63,27 @@ YouTube Digest 需要你在自己的服务账号中准备两个 Key：
 
 如果页面流程发生变化，请查看 [Supadata 官方文档](https://docs.supadata.ai/)。
 
-### 获取 DeepSeek API Key
+### 获取 TokenDance API Key
 
-1. 打开 DeepSeek 官方 [API Keys 页面](https://platform.deepseek.com/api_keys)。
-2. 按照提示登录，或创建 DeepSeek 开放平台账号。
-3. 点击 **Create new API key**，填写容易识别的名称，例如 `YouTube Digest`，然后创建 Key。
+1. 打开 TokenDance 官方[快速入门页面](https://tokendance.space/docs/quickstart)。
+2. 按照提示登录，或创建 TokenDance 账号。
+3. 创建 API Key，填写容易识别的名称，例如 `YouTube Digest`，然后保存。
 4. 立即复制 Key。完整 Key 可能只会显示一次。
-5. 把 Key 粘贴到 YouTube Digest 设置中的 **DeepSeek API key**。
-6. 如果 DeepSeek 提示余额不足，请在 DeepSeek 开放平台账号中充值后再试。
+5. 把 Key 粘贴到 YouTube Digest 设置中的 **TokenDance API key**。
+6. 如果 TokenDance 提示余额不足，请在 TokenDance 账号中充值后再试。
 
-当前账号和接口说明请查看 [DeepSeek 官方 API 文档](https://api-docs.deepseek.com/)。
+当前账号和接口说明请查看 [TokenDance 官方文档](https://tokendance.space/docs/quickstart)。
 
 在侧边栏中打开 **Settings**。你也可以在 `chrome://extensions` 的 YouTube Digest 卡片中打开扩展选项。Key 只能粘贴到这些设置输入框中。不要把 Key 发送到 AI 对话、项目文件、截图或公开消息中。
 
-发布版本只支持 DeepSeek V4 Flash：
+发布版本通过 TokenDance 使用 DeepSeek V4 Flash (0731)：
 
 ```text
-Base URL: https://api.deepseek.com
-Model: deepseek-v4-flash
+Base URL: https://tokendance.space/gateway/v1
+Model: deepseek-v4-flash-0731
 ```
 
-YouTube Digest 会让所有 DeepSeek 请求使用非思考模式，以获得更快、更稳定的交互。设置中的接口地址和模型固定，只需要填写 DeepSeek API Key。如果想使用其他服务或模型，请在设置中复制安全的自定义 prompt，让编程 Agent 修改你自己的本地副本。不要把任何 API Key 放进 prompt 或对话。
+YouTube Digest 通过 TokenDance 使用 OpenAI 兼容格式发送请求。设置中的接口地址和模型固定，只需要填写 TokenDance API Key。如果想使用其他服务或模型，请在设置中复制安全的自定义 prompt，让编程 Agent 修改你自己的本地副本。不要把任何 API Key 放进 prompt 或对话。
 
 API Key 和设置保存在你设备上的 Chrome 扩展本地存储中。发布包不会包含或使用 `config.js`。
 
@@ -104,7 +104,7 @@ API Key 和设置保存在你设备上的 Chrome 扩展本地存储中。发布�
 - 原文、简体中文和双语对照字幕。
 - AI 概览、选中文本讲解、翻译和自动润色笔记。
 - 本地笔记，以及最近字幕、概览和翻译的本地缓存。
-- 发布版本的所有 AI 功能都使用 DeepSeek V4 Flash。其他服务需要修改本地代码，不属于发布版本的支持范围。
+- 发布版本的所有 AI 功能都通过 TokenDance 使用 DeepSeek V4 Flash (0731)。其他服务需要修改本地代码，不属于发布版本的支持范围。
 
 Shorts、直播、私密视频、受访问限制的视频，以及没有原生字幕的视频可能无法使用。目前没有测试 Firefox、Safari、移动浏览器或其他 Chromium 浏览器。
 
@@ -122,9 +122,9 @@ YouTube Digest 强制使用 Supadata 的 `mode=native`，不会在没有原生�
 
 按照当前只获取原生字幕的方式，如果每次请求都成功，免费版每月大约可以查询 100 个视频。重试和没有字幕的查询也会消耗额度，所以实际成功数量可能更少。
 
-DeepSeek 的额度与 Supadata 分开计算。DeepSeek 可能有自己的免费额度、限速或费用。YouTube Digest 不收款，也不转售 API 服务。建议为两个账号设置消费上限并定期查看用量。下方估算说明了当前 DeepSeek 翻译成本。
+TokenDance 的额度与 Supadata 分开计算。TokenDance 可能有自己的免费额度、限速或费用。YouTube Digest 不收款，也不转售 API 服务。建议为两个账号设置消费上限并定期查看用量。下方估算说明了通过 TokenDance 使用 DeepSeek V4 Flash (0731) 的当前翻译成本。
 
-## DeepSeek V4 Flash 翻译成本估算
+## DeepSeek V4 Flash (0731) 通过 TokenDance 翻译成本估算
 
 截至 2026 年 8 月 10 日，DeepSeek 官方[价格页面](https://api-docs.deepseek.com/quick_start/pricing/)列出的每 100 万 token 价格是：
 
@@ -163,11 +163,11 @@ YouTube Digest 使用原生 HTML、CSS 和 JavaScript，没有构建步骤，很
 YouTube Digest 会直接从扩展向服务商发送请求：
 
 1. 把标准化的 YouTube 视频地址发送给 Supadata，用于获取原生字幕。
-2. 当你使用 AI 功能时，把字幕和相关视频信息发送给 DeepSeek。
+2. 当你使用 AI 功能时，把字幕和相关视频信息发送给 TokenDance。
 3. 翻译或讲解等功能只发送当前需要的内容，例如选中的文本和上下文，或少量字幕分段。
 4. API Key、设置、笔记和最近缓存保存在 Chrome 本地。
 
-YouTube Digest 没有账号系统、广告、分析统计或行为追踪。Supadata 和 DeepSeek 仍会按照各自的条款和隐私政策处理数据。详情请查看 [PRIVACY.md](PRIVACY.md)。
+YouTube Digest 没有账号系统、广告、分析统计或行为追踪。Supadata 和 TokenDance 仍会按照各自的条款和隐私政策处理数据。详情请查看 [PRIVACY.md](PRIVACY.md)。
 
 ## 常见问题
 
@@ -188,9 +188,9 @@ YouTube Digest 没有账号系统、广告、分析统计或行为追踪。Supad
 
 ### YouTube Digest 提示需要设置
 
-- 打开 **Settings**，保存 Supadata Key 和 DeepSeek Key。
-- 发布版本固定使用 DeepSeek V4 Flash，没有需要填写的 Base URL 或 Model 字段。
-- 如果设置提示旧的自定义服务已移除，请重新填写 DeepSeek Key。旧 AI Key 已安全清除，避免被错误用于 DeepSeek。
+- 打开 **Settings**，保存 Supadata Key 和 TokenDance Key。
+- 发布版本固定通过 TokenDance 使用 DeepSeek V4 Flash (0731)，没有需要填写的 Base URL 或 Model 字段。
+- 如果设置提示旧的自定义服务已移除，请重新填写 TokenDance Key。旧 AI Key 已安全清除，避免被错误使用。
 
 ### 找不到字幕
 
@@ -202,9 +202,9 @@ YouTube Digest 不会自动改用 AI 生成字幕。
 
 ### AI 请求失败
 
-- `401` 或 `403` 通常表示 DeepSeek Key 或账号权限有问题。
-- `429` 通常表示达到了 DeepSeek 服务限速或消费上限。
-- 确认 Key 来自上方链接的 DeepSeek 开放平台账号，并且账号有可用额度。
+- `401` 或 `403` 通常表示 TokenDance Key 或账号权限有问题。
+- `429` 通常表示达到了 TokenDance 服务限速或消费上限。
+- 确认 Key 来自上方链接的 TokenDance 账号，并且账号有可用额度。
 - 如果你把本地副本改成了其他模型，请再次使用设置中的自定义 prompt，让编程 Agent 检查本地实现。
 
 不要在对话、截图或日志中分享 API Key、私密字幕或个人笔记。

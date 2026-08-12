@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 
 const settings = require("../settings.js");
 
-test("DeepSeek defaults use V4 Flash", () => {
+test("TokenDance defaults use deepseek-v4-flash-0731", () => {
   const normalized = settings.normalize({
     provider: "unexpected",
     aiApiKey: "  example-key  ",
@@ -12,14 +12,14 @@ test("DeepSeek defaults use V4 Flash", () => {
     supadataApiKey: "  example-supadata  ",
   });
 
-  assert.equal(normalized.provider, "deepseek");
-  assert.equal(normalized.aiBaseUrl, "https://api.deepseek.com");
-  assert.equal(normalized.aiModel, "deepseek-v4-flash");
+  assert.equal(normalized.provider, "tokendance");
+  assert.equal(normalized.aiBaseUrl, "https://tokendance.space/gateway/v1");
+  assert.equal(normalized.aiModel, "deepseek-v4-flash-0731");
   assert.equal(normalized.aiApiKey, "example-key");
   assert.equal(normalized.supadataApiKey, "example-supadata");
   assert.equal(
     settings.chatCompletionsUrl(),
-    "https://api.deepseek.com/chat/completions",
+    "https://tokendance.space/gateway/v1/chat/completions",
   );
 });
 
@@ -34,7 +34,7 @@ test("legacy custom migration clears only the AI key and is idempotent", () => {
   const first = settings.migrateLegacyCustom(legacy);
 
   assert.equal(first.migrated, true);
-  assert.equal(first.settings.provider, "deepseek");
+  assert.equal(first.settings.provider, "tokendance");
   assert.equal(first.settings.aiBaseUrl, settings.DEFAULTS.aiBaseUrl);
   assert.equal(first.settings.aiModel, settings.DEFAULTS.aiModel);
   assert.equal(first.settings.aiApiKey, "");
@@ -44,11 +44,11 @@ test("legacy custom migration clears only the AI key and is idempotent", () => {
   assert.equal(second.migrated, false);
   assert.deepEqual(second.settings, first.settings);
 
-  const configuredDeepSeek = settings.normalize({
+  const configuredKey = settings.normalize({
     ...first.settings,
-    aiApiKey: "new-deepseek-key",
+    aiApiKey: "new-tokendance-key",
   });
-  assert.equal(configuredDeepSeek.aiApiKey, "new-deepseek-key");
+  assert.equal(configuredKey.aiApiKey, "new-tokendance-key");
 });
 
 test("Supadata receives a canonical YouTube URL", () => {

@@ -51,7 +51,7 @@ Because this is an unpacked extension, it does not update automatically. After d
 YouTube Digest needs two keys under your own provider accounts:
 
 1. A **Supadata API key** to retrieve YouTube transcripts.
-2. A **DeepSeek API key** for overviews, explanations, translation, and automatic note polishing.
+2. A **TokenDance API key** for overviews, explanations, translation, and automatic note polishing.
 
 ### Get a Supadata API key
 
@@ -63,27 +63,27 @@ YouTube Digest needs two keys under your own provider accounts:
 
 See the [official Supadata documentation](https://docs.supadata.ai/) if the dashboard flow changes.
 
-### Get a DeepSeek API key
+### Get a TokenDance API key
 
-1. Open the official [DeepSeek API Keys page](https://platform.deepseek.com/api_keys).
-2. Sign in or create a DeepSeek Platform account when prompted.
-3. Choose **Create new API key**, give it a recognizable name such as `YouTube Digest`, and create it.
+1. Open the official [TokenDance quick-start page](https://tokendance.space/docs/quickstart).
+2. Sign in or create a TokenDance account when prompted.
+3. Create an API key, give it a recognizable name such as `YouTube Digest`, and save it.
 4. Copy the key immediately. The full key may only be shown once.
-5. Paste it into **DeepSeek API key** in YouTube Digest Settings.
-6. If DeepSeek reports insufficient balance, add credit in your DeepSeek Platform account and try again.
+5. Paste it into **TokenDance API key** in YouTube Digest Settings.
+6. If TokenDance reports insufficient balance, add credit in your TokenDance account and try again.
 
-See the [official DeepSeek API documentation](https://api-docs.deepseek.com/) for current account and API details.
+See the [official TokenDance documentation](https://tokendance.space/docs/quickstart) for current account and API details.
 
 Open **Settings** from the side panel. You can also open the YouTube Digest **Options** page from its card at `chrome://extensions` or by right-clicking its toolbar icon. Paste keys only into these Settings fields. Never paste a key into an AI chat, repository file, screenshot, or public message.
 
-The published version supports DeepSeek V4 Flash as its only AI provider:
+The published version routes AI requests through TokenDance using DeepSeek V4 Flash (0731):
 
 ```text
-Base URL: https://api.deepseek.com
-Model: deepseek-v4-flash
+Base URL: https://tokendance.space/gateway/v1
+Model: deepseek-v4-flash-0731
 ```
 
-YouTube Digest sends every DeepSeek request in non-thinking mode for responsive, predictable interactions. The endpoint and model are fixed in Settings, so the only AI credential you enter is your DeepSeek API key. To use another provider or model, copy the safe customization prompt in Settings and give it to a coding agent for your local copy. Never add an API key to that prompt or chat.
+YouTube Digest uses an OpenAI-compatible request format via TokenDance. The endpoint and model are fixed in Settings, so the only AI credential you enter is your TokenDance API key. To use another provider or model, copy the safe customization prompt in Settings and give it to a coding agent for your local copy. Never add an API key to that prompt or chat.
 
 Keys and settings are stored in Chrome's local extension storage on your device. Release builds do not include or use `config.js`.
 
@@ -104,7 +104,7 @@ Keys and settings are stored in Chrome's local extension storage on your device.
 - Original, Simplified Chinese, and aligned bilingual transcript views.
 - AI overviews, selected-text explanations, translation, and automatic note polishing.
 - Local notes and a local cache for recent transcript and digest results.
-- DeepSeek V4 Flash for all published AI features. Other providers require a local code adaptation and are not supported by this published version.
+- DeepSeek V4 Flash (0731) via TokenDance for all published AI features. Other providers require a local code adaptation and are not supported by this published version.
 
 Shorts, live streams, private or access-restricted videos, and videos without an available native transcript may not work. Firefox, Safari, mobile browsers, and other Chromium browsers are not currently tested or supported.
 
@@ -122,9 +122,9 @@ The [Supadata transcript documentation](https://docs.supadata.ai/get-transcript)
 
 With the current native-only behavior, the free tier can cover roughly 100 transcript lookups per month when each request succeeds once. Retries and unavailable-caption lookups also consume credits, so actual successful-video coverage can be lower.
 
-DeepSeek usage is separate from Supadata. DeepSeek may apply its own free quota, rate limits, or charges. YouTube Digest does not collect payments or resell access. Set spending limits and monitor both accounts. The estimate below explains the current DeepSeek translation cost.
+TokenDance usage is separate from Supadata. TokenDance may apply its own free quota, rate limits, or charges. YouTube Digest does not collect payments or resell access. Set spending limits and monitor both accounts. The estimate below explains the current translation cost based on DeepSeek V4 Flash (0731) pricing via TokenDance.
 
-## DeepSeek V4 Flash translation cost estimate
+## DeepSeek V4 Flash (0731) via TokenDance translation cost estimate
 
 Current as of August 10, 2026, DeepSeek lists the following prices per 1 million tokens on its official [pricing page](https://api-docs.deepseek.com/quick_start/pricing/):
 
@@ -163,11 +163,11 @@ If you want another AI provider or model, first open the exact YouTube Digest pr
 YouTube Digest makes provider requests directly from the extension:
 
 1. It sends a canonical YouTube watch URL to Supadata to request the native transcript.
-2. It sends the transcript and relevant video metadata to DeepSeek when you request AI features.
+2. It sends the transcript and relevant video metadata to TokenDance when you request AI features.
 3. Focused features send only the content they need, such as selected text with context or small transcript batches for translation.
 4. It stores keys, settings, notes, and recent cache entries locally in Chrome.
 
-There is no YouTube Digest account system, advertising, analytics, or telemetry. Supadata and DeepSeek still receive data under their own terms and privacy policies. See [PRIVACY.md](PRIVACY.md) for details.
+There is no YouTube Digest account system, advertising, analytics, or telemetry. Supadata and TokenDance still receive data under their own terms and privacy policies. See [PRIVACY.md](PRIVACY.md) for details.
 
 ## Troubleshooting
 
@@ -188,9 +188,9 @@ There is no YouTube Digest account system, advertising, analytics, or telemetry.
 
 ### YouTube Digest asks for setup
 
-- Open **Settings** and save both a Supadata key and a DeepSeek key.
-- This published version uses the fixed DeepSeek V4 Flash endpoint and model. There are no Base URL or Model fields to configure.
-- If Settings says a legacy custom provider was removed, enter a DeepSeek key. The old AI key was cleared so it could not be reused with the wrong service.
+- Open **Settings** and save both a Supadata key and a TokenDance key.
+- This published version uses the fixed TokenDance endpoint and DeepSeek V4 Flash (0731) model. There are no Base URL or Model fields to configure.
+- If Settings says a legacy custom provider was removed, enter a TokenDance key. The old AI key was cleared so it could not be reused with the wrong service.
 
 ### No transcript is found
 
@@ -202,9 +202,9 @@ YouTube Digest will not fall back to generated transcription.
 
 ### AI requests fail
 
-- A `401` or `403` usually means the DeepSeek key or account access is invalid.
-- A `429` usually means a DeepSeek rate or spending limit was reached.
-- Confirm the key was created in the DeepSeek Platform account linked above and that the account has available credit.
+- A `401` or `403` usually means the TokenDance key or account access is invalid.
+- A `429` usually means a TokenDance rate or spending limit was reached.
+- Confirm the key was created in the TokenDance account linked above and that the account has available credit.
 - If you adapted a local copy for another model, use the Settings customization prompt again and ask your coding agent to inspect that local implementation.
 
 Never share API keys, private transcripts, or personal notes in chats, screenshots, or logs.

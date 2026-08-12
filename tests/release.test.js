@@ -15,7 +15,7 @@ test("manifest uses minimized install-time permissions", () => {
   assert.equal(packageJson.version, manifest.version);
   assert.equal(manifest.options_ui.page, "options.html");
   assert.ok(!manifest.permissions.includes("activeTab"));
-  assert.ok(manifest.host_permissions.includes("https://api.deepseek.com/*"));
+  assert.ok(manifest.host_permissions.includes("https://tokendance.space/*"));
   assert.equal(Object.hasOwn(manifest, "optional_host_permissions"), false);
   assert.equal(manifest.version, "1.1.5");
 });
@@ -94,7 +94,7 @@ test("release copy documents current scope without em dashes", () => {
   assert.match(readme, /supadata\.ai\/pricing/i);
   assert.match(readme, /docs\.supadata\.ai\/get-transcript/i);
   assert.match(readme, /dash\.supadata\.ai\/auth\/sign-up/i);
-  assert.match(readme, /platform\.deepseek\.com\/api_keys/i);
+  assert.match(readme, /tokendance\.space\/docs\/quickstart/i);
   assert.match(readme, /api-docs\.deepseek\.com/i);
   assert.match(readme, /api-docs\.deepseek\.com\/quick_start\/pricing/i);
   assert.match(readme, /api-docs\.deepseek\.com\/quick_start\/token_usage/i);
@@ -111,7 +111,7 @@ test("release copy documents current scope without em dashes", () => {
   assert.match(chineseReadme, /\u7ea6 32,600 \u4e2a\u8f93\u5165 token/);
   assert.match(chineseReadme, /\$0\.002[^\n]*\$0\.006 USD/);
   assert.match(chineseReadme, /dash\.supadata\.ai\/auth\/sign-up/i);
-  assert.match(chineseReadme, /platform\.deepseek\.com\/api_keys/i);
+  assert.match(chineseReadme, /tokendance\.space\/docs\/quickstart/i);
   assert.match(readme, /^### The Digest button is missing on a YouTube video$/m);
   assert.match(
     chineseReadme,
@@ -122,7 +122,7 @@ test("release copy documents current scope without em dashes", () => {
   const optionsStyles = read("options.css");
   const optionsScript = read("options.js");
   assert.match(optionsPage, /dash\.supadata\.ai\/auth\/sign-up/i);
-  assert.match(optionsPage, /platform\.deepseek\.com\/api_keys/i);
+  assert.match(optionsPage, /tokendance\.space\/docs\/quickstart/i);
   assert.doesNotMatch(optionsPage, /<select\b/i);
   assert.doesNotMatch(optionsPage, /id="(?:provider|aiBaseUrl|aiModel)"/);
   const detailsTag = optionsPage.match(
@@ -179,8 +179,8 @@ test("release copy documents current scope without em dashes", () => {
   assert.doesNotMatch(publishedDocs, /optional custom-origin/i);
   assert.doesNotMatch(publishedDocs, /chosen AI provider/i);
   assert.doesNotMatch(publishedDocs, /configure a different OpenAI-compatible/i);
-  assert.match(readme, /published version supports DeepSeek V4 Flash as its only AI provider/i);
-  assert.match(chineseReadme, /发布版本只支持 DeepSeek V4 Flash/);
+  assert.match(readme, /routes AI requests through TokenDance using DeepSeek V4 Flash/i);
+  assert.match(chineseReadme, /通过 TokenDance 使用 DeepSeek V4 Flash/);
 });
 
 test("notes filters preserve selected contrast and expose pressed state", () => {
@@ -225,7 +225,7 @@ test("runtime has no source-file credential dependency or retired model", () => 
   assert.doesNotMatch(runtime, /\bCONFIG\./);
   assert.doesNotMatch(runtime, /importScripts\(["']config\.js/);
   assert.doesNotMatch(runtime, /\bdeepseek-chat\b/);
-  assert.match(runtime, /deepseek-v4-flash/);
+  assert.match(runtime, /deepseek-v4-flash-0731/);
 });
 
 test("retired Remix and reader files are absent", () => {
