@@ -14,9 +14,10 @@ Depending on the feature you use, YouTube Digest handles:
 - text you select in the transcript and nearby transcript context;
 - transcript context around a timestamped note;
 - content you ask to translate;
+- vocabulary items extracted from a transcript, each with its example sentence, meaning, and timestamp;
 - notes you save;
 - Supadata and TokenDance configuration, including API keys; and
-- cached transcript, digest, and translation results.
+- cached transcript, digest, translation, and dictionary-gloss results.
 
 ## Where data goes
 
@@ -32,6 +33,9 @@ The published version sends AI feature content to DeepSeek V4 Flash (0731) via T
 - selected text plus nearby transcript context for an explanation;
 - small semantic transcript batches currently needed for progressive Chinese
   translation, or requested overview or explanation content;
+- transcript chunks plus the video title when extracting vocabulary;
+- a list of English words, with no transcript or video context, when building
+  printable vocabulary cards;
 - nearby transcript context and video metadata when polishing a saved note.
 
 The endpoint and `deepseek-v4-flash-0731` model are fixed in the published Settings page. You provide one TokenDance API key. To use another provider or model, you must adapt your own local source copy and its permissions. The Settings page provides a coding-agent prompt for that purpose and warns you never to include an API key in the prompt or chat.
@@ -49,6 +53,12 @@ YouTube Digest uses Chrome's local extension storage, not a YouTube Digest cloud
 - Recent transcript, digest, and per-segment translation cache entries are stored
   locally. The cache is limited to 20 videos, and entries older than 30 days are
   removed when the side panel opens.
+- Dictionary glosses for vocabulary cards are cached locally by word so the same
+  word is looked up only once. This cache is not tied to a video, holds the most
+  recent 2,000 words, and contains no transcript or video content.
+- A vocabulary card export is handed to its own tab through Chrome's session
+  storage, which the tab deletes as soon as it reads it and Chrome discards when
+  the browser closes.
 
 Chrome extension storage is not a password vault. Anyone with sufficient access to your browser profile or device may be able to recover locally stored keys or content. Use scoped keys where providers support them, set spending limits, and rotate or revoke a key if the device or browser profile is compromised.
 
@@ -71,7 +81,7 @@ YouTube Digest uses Chrome permissions for these purposes:
 - `scripting`: coordinate the extension's YouTube page controls.
 - YouTube host access: read the active video's URL and metadata and provide timestamp controls.
 - Supadata host access: retrieve transcripts.
-- TokenDance host access: provide AI overviews, explanations, translation, and note polishing through DeepSeek V4 Flash (0731) via TokenDance.
+- TokenDance host access: provide AI overviews, explanations, translation, vocabulary extraction, dictionary glosses, and note polishing through DeepSeek V4 Flash (0731) via TokenDance.
 
 YouTube Digest does not use these permissions to monitor general browsing activity.
 

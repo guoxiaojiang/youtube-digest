@@ -32,6 +32,8 @@ public_allowlist=(
   "sidepanel.html"
   "sidepanel.css"
   "sidepanel.js"
+  "vocab-cards.html"
+  "vocab-cards.js"
   "options.html"
   "options.css"
   "options.js"

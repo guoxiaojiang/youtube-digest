@@ -204,6 +204,12 @@ body {
   overflow-y: auto;
 }
 
+/* Focused only so it can be scrolled by keyboard, never as a Tab stop, so a
+   ring around the whole panel would be noise. */
+.content:focus {
+  outline: none;
+}
+
 .tab-panel {
   display: none;
 }

@@ -38,7 +38,11 @@
     </div>
 
     <!-- MAIN CONTENT -->
-    <div class="content" id="contentArea">
+    <!-- tabindex makes the scroll container focusable: keyboard scrolling
+         and its keydown events both require focus, and without this a
+         click in the transcript leaves focus outside it. -1 keeps it out
+         of the Tab order — it holds no controls of its own. -->
+    <div class="content" id="contentArea" tabindex="-1">
       <!-- WELCOME STATE -->
       <div id="welcomeState" class="welcome-container">
         <div class="welcome-icon">&#9655;</div>
@@ -128,6 +132,14 @@
             <div class="section-header">
               <div class="section-title">Vocabulary</div>
               <div class="vocab-actions">
+                <button
+                  class="enhance-btn"
+                  id="exportVocabCardsBtn"
+                  type="button"
+                  style="display: none"
+                >
+                  Export cards
+                </button>
                 <button class="enhance-btn" id="findVocabBtn" type="button">Extract vocabulary</button>
               </div>
             </div>

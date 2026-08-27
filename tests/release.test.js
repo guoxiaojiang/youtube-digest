@@ -44,6 +44,14 @@ test("release copy documents current scope without em dashes", () => {
     /Turn every YouTube video into a resource for deep learning\./,
   );
   assert.doesNotMatch(readme, /before deciding how much of it to watch/i);
+  // Vocabulary extraction and card export ship, so both READMEs must describe
+  // them as current scope rather than as a remix idea.
+  assert.match(readme, /Vocabulary extraction with dictionary glosses/);
+  assert.match(readme, /printable A4 dictation sheets \(Save as PDF\)/);
+  assert.doesNotMatch(readme, /vocabulary notebook/i);
+  assert.match(chineseReadme, /提取生词并补充词典释义/);
+  assert.doesNotMatch(chineseReadme, /增加生词本/);
+
   assert.match(readme, /^## Install with your coding agent$/m);
   assert.match(
     readme,
@@ -159,7 +167,6 @@ test("release copy documents current scope without em dashes", () => {
   assert.match(readme, /^## Remix it with your coding agent$/m);
   assert.match(readme, /more translation languages/i);
   assert.match(readme, /customized summary templates/i);
-  assert.match(readme, /vocabulary notebook/i);
   assert.match(
     readme,
     /first open the exact YouTube Digest project folder that Chrome loaded through \*\*Load unpacked\*\* in your coding agent/,

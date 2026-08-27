@@ -91,7 +91,35 @@ function sendTranslationMessage(message) {
 let autoScrollEnabled = true; // True = scroll transcript to follow video playback
 let jumpNextHighlightWithoutAnimation = false; // Set when transcript re-renders (tab switch, cache reload) so the first highlight jumps to the current line instantly, no smooth animation.
 let autoScrollInterval = null; // setInterval ID for polling video time
-let lastAutoScrollTime = 0; // Timestamp of last programmatic scroll (ignores scroll events within 1s)
+let anchorSettleUntil = 0; // Timestamp until which our own smooth scroll is still animating
+let userScrollListenersBound = false; // Guards one-time binding of the user-intent listeners
+
+// Auto-scroll is only released by real user input (wheel, touch drag, scroll
+// keys, scrollbar drag) — never by scroll events, because our own smooth
+// scrolling emits those too and a long animation outlives any time window.
+const SCROLL_INTENT_KEYS = new Set([
+  "ArrowUp",
+  "ArrowDown",
+  "PageUp",
+  "PageDown",
+  "Home",
+  "End",
+  " ",
+]);
+
+// How far the spoken line may drift from the middle before we re-center it,
+// and how long a smooth re-center is given to land before the next attempt.
+const ANCHOR_TOLERANCE_PX = 56;
+const ANCHOR_SETTLE_MS = 700;
+
+// Last playback position reported by the YouTube tab. Translation uses this to
+// start where the viewer actually is instead of at the top of the video.
+let lastKnownPlaybackSeconds = 0;
+
+// Translation window around the playback position: a couple of segments behind
+// for context, and a longer run ahead since that is where playback is heading.
+const TRANSLATION_LOOKBEHIND_SEGMENTS = 2;
+const TRANSLATION_LOOKAHEAD_SEGMENTS = 6;
 
 // ============================================================
 // TRANSCRIPT GROUPING
@@ -400,7 +428,7 @@ function setupEventListeners() {
     .getElementById("followPlaybackBtn")
     ?.addEventListener("click", () => {
       autoScrollEnabled = true;
-      document.getElementById("followPlaybackBtn").style.display = "none";
+      syncFollowPlaybackButton();
       // Jump straight back to the line currently being spoken. We scroll
       // directly (not via playbackTrackingTick) because the tick skips
       // entries that are already highlighted — and the current line almost
@@ -408,6 +436,8 @@ function setupEventListeners() {
       if (!scrollToActiveEntry()) {
         playbackTrackingTick(); // No highlight yet — let a tick establish one
       }
+      // Translation now prioritizes wherever playback is, not the video start.
+      requestTranslationAroundPlayback();
     });
 
   // Notes filter buttons
@@ -424,6 +454,9 @@ function setupEventListeners() {
   document.getElementById("findVocabBtn")?.addEventListener("click", () => {
     triggerVocabulary();
   });
+  document
+    .getElementById("exportVocabCardsBtn")
+    ?.addEventListener("click", exportVocabCards);
   // Delegated handler for the CTA button that lives inside the vocab list,
   // since the list innerHTML is rebuilt on every state change.
   document.getElementById("vocabList")?.addEventListener("click", (event) => {
@@ -561,6 +594,11 @@ async function startDigest(videoId, videoUrl) {
     translationGeneration += 1;
     if (transcriptScrollObserver) transcriptScrollObserver.disconnect();
     transcriptScrollObserver = null;
+    // The previous video's position must not seed this one: the seek lands on
+    // the last segment starting at or before it, so carrying a large value into
+    // a shorter video starts translating at its END instead of where playback
+    // actually is. Zero seeds the opening until the first tracking tick lands.
+    lastKnownPlaybackSeconds = 0;
   }
 
   // Check cache for this video
@@ -593,6 +631,7 @@ async function startDigest(videoId, videoUrl) {
         const status = document.getElementById("vocabStatus");
         if (status) status.textContent = `Done. Extracted ${currentVocabItems.length} words from the full video.`;
         updateVocabList(currentVocabItems);
+        updateVocabExportButton();
       }
     }
 
@@ -1427,6 +1466,7 @@ function resetVocabUI() {
   if (tab) tab.textContent = "Vocab";
   if (progress) progress.style.display = "none";
   if (fill) fill.style.width = "0%";
+  updateVocabExportButton();
 }
 
 // ============================================================
@@ -1561,6 +1601,7 @@ async function triggerVocabulary() {
   // Persist the final vocabulary list so it survives tab switches.
   saveSessionState();
   isVocabLoading = false;
+  updateVocabExportButton();
 }
 
 function splitTranscriptForVocab(transcriptText, maxChars) {
@@ -1740,24 +1781,79 @@ Field rules:
   return items;
 }
 
+/**
+ * Searches currentTranscript for the line that contains the vocabulary word
+ * AND whose text is part of the given sentence. Returns that line's start
+ * time (seconds), or null if no match is found.
+ *
+ * This is more accurate than trusting the AI's timestamp, because the AI
+ * assigns the timestamp of the first line of a multi-line sentence even
+ * when the word only appears in a later line.
+ */
+function findWordTimestampInTranscript(word, sentence) {
+  if (!currentTranscript || !currentTranscript.length) return null;
+  const wordLower = word.toLowerCase();
+  const sentenceLower = sentence.toLowerCase();
+
+  // Prefer lines that both contain the word and are a substring of the sentence.
+  const strong = currentTranscript.filter((line) => {
+    const t = line.text.toLowerCase();
+    return t.includes(wordLower) && sentenceLower.includes(t);
+  });
+  if (strong.length) return strong[0].start;
+
+  // Fallback: any line containing the word that overlaps with the sentence.
+  const weak = currentTranscript.filter((line) =>
+    line.text.toLowerCase().includes(wordLower),
+  );
+  if (!weak.length) return null;
+
+  // Among weak matches, pick the one whose text has the most overlap with the sentence.
+  let best = null;
+  let bestOverlap = 0;
+  for (const line of weak) {
+    const words = line.text.toLowerCase().split(/\s+/);
+    const overlap = words.filter((w) => sentenceLower.includes(w)).length;
+    if (overlap > bestOverlap) { bestOverlap = overlap; best = line; }
+  }
+  return best ? best.start : weak[0].start;
+}
+
 function normalizeVocabItem(item, localSeen) {
   const word = typeof item?.word === "string" ? item.word.trim().slice(0, 100) : "";
   const chinese = typeof item?.chinese === "string" ? item.chinese.trim().slice(0, 100) : "";
   const sentence = typeof item?.sentence === "string" ? item.sentence.trim().slice(0, 1000) : "";
-  const seconds = Number(item?.timestampSeconds);
-  const timestamp = typeof item?.timestamp === "string" ? item.timestamp.trim() : "";
-  if (!word || !sentence || !Number.isFinite(seconds) || seconds < 0) return null;
+  const tsString = typeof item?.timestamp === "string" ? item.timestamp.trim() : "";
+  if (!word || !sentence) return null;
   if (localSeen.has(word.toLowerCase())) return null;
   localSeen.add(word.toLowerCase());
-  const safeSeconds = Math.floor(seconds);
+
+  // First try: locate the exact transcript line that contains the word.
+  // This is the most accurate because it avoids the AI mis-attributing a
+  // multi-line sentence's timestamp to the first line when the word is later.
+  let safeSeconds = findWordTimestampInTranscript(word, sentence) ?? -1;
+
+  if (safeSeconds < 0) {
+    // Second try: parse the "M:SS" string the AI copied from the [MM:SS] markers.
+    const tsMatch = tsString.match(/^(\d+):(\d{2})$/);
+    if (tsMatch) {
+      safeSeconds = parseInt(tsMatch[1], 10) * 60 + parseInt(tsMatch[2], 10);
+    } else {
+      // Last resort: trust the AI's own arithmetic.
+      const fallback = Math.floor(Number(item?.timestampSeconds));
+      safeSeconds = Number.isFinite(fallback) && fallback >= 0 ? fallback : 0;
+    }
+  }
+
   const mins = Math.floor(safeSeconds / 60);
   const secs = safeSeconds % 60;
+  const timestamp = `${mins}:${String(secs).padStart(2, "0")}`;
   return {
     word,
     chinese,
     sentence,
     timestampSeconds: safeSeconds,
-    timestamp: timestamp || `${mins}:${String(secs).padStart(2, "0")}`,
+    timestamp,
   };
 }
 
@@ -1829,6 +1925,258 @@ function updateVocabList(items) {
     div.addEventListener("click", () => seekTo(item.timestampSeconds));
     list.appendChild(div);
   });
+
+  updateVocabExportButton();
+}
+
+// ============================================================
+// VOCABULARY CARD EXPORT (printable HTML → PDF)
+// ============================================================
+
+// The panel stores one context-specific gloss per word ("灌木"), which is what a
+// viewer needs mid-video. A printed dictation sheet needs the opposite: the
+// word's common dictionary senses, grouped by part of speech, so the sheet is
+// still useful weeks later without the video. Glosses are fetched once per word
+// and cached across videos, since vocabulary repeats.
+const GLOSS_CACHE_KEY = "ytd_vocab_glosses";
+const GLOSS_CACHE_MAX = 2000;
+const GLOSS_BATCH_SIZE = 40;
+const GLOSS_MAX_TOKENS = 8000;
+const GLOSS_MAX_SENSE_LINES = 4;
+const GLOSS_MAX_LINE_CHARS = 60;
+
+/** Only offer the export once there is a finished list worth printing. */
+function updateVocabExportButton() {
+  const btn = document.getElementById("exportVocabCardsBtn");
+  if (!btn) return;
+  const count = currentVocabItems?.length || 0;
+  const ready = count > 0 && !isVocabLoading;
+  btn.style.display = ready ? "" : "none";
+  btn.textContent = `Export cards (${count})`;
+}
+
+async function loadGlossCache() {
+  try {
+    const stored = await chrome.storage.local.get(GLOSS_CACHE_KEY);
+    const cache = stored[GLOSS_CACHE_KEY];
+    return cache && typeof cache === "object" ? cache : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Writes the gloss cache back, trimmed to the newest GLOSS_CACHE_MAX entries.
+ * Object key order is insertion order, so slicing from the end keeps the words
+ * looked up most recently.
+ */
+async function saveGlossCache(cache) {
+  try {
+    const keys = Object.keys(cache);
+    let trimmed = cache;
+    if (keys.length > GLOSS_CACHE_MAX) {
+      trimmed = {};
+      for (const key of keys.slice(-GLOSS_CACHE_MAX)) trimmed[key] = cache[key];
+    }
+    await chrome.storage.local.set({ [GLOSS_CACHE_KEY]: trimmed });
+  } catch (err) {
+    console.warn("[YouTube Digest] Gloss cache write failed:", err.message);
+  }
+}
+
+/**
+ * Cleans one dictionary sense line. Normalizes the part-of-speech prefix to
+ * "abbr. " so the printed column aligns, and drops anything that arrived
+ * without recognizable Chinese content.
+ */
+function normalizeGlossLine(text) {
+  const line = String(text || "")
+    .replace(/\s+/g, " ")
+    .replace(/[;；]\s*$/, "")
+    .trim();
+  if (!line) return "";
+  const withPos = line.replace(
+    /^((?:n|v|vt|vi|adj|adv|prep|conj|pron|int|num|art|aux|abbr)\.(?:\s*(?:n|v|vt|vi|adj|adv|prep|conj|pron|int|num|art|aux|abbr)\.)*)\s*/i,
+    (match, pos) => `${pos.replace(/\s*\./g, ". ").trim()} `,
+  );
+  return withPos.slice(0, GLOSS_MAX_LINE_CHARS);
+}
+
+/** Keeps only usable sense lines, capped so a row cannot overflow its cell. */
+function normalizeGlossSenses(senses) {
+  if (!Array.isArray(senses)) return [];
+  const lines = [];
+  for (const sense of senses) {
+    const line = normalizeGlossLine(sense);
+    if (line && !lines.includes(line)) lines.push(line);
+    if (lines.length >= GLOSS_MAX_SENSE_LINES) break;
+  }
+  return lines;
+}
+
+/**
+ * Asks the provider for dictionary senses for one batch of words. Returns a
+ * Map of lowercase word to sense-line array; words the model skipped are simply
+ * absent, and the caller falls back to the contextual gloss.
+ */
+async function fetchGlossBatch(words, settings) {
+  const systemPrompt = `You are a bilingual dictionary for Chinese-speaking learners of English.
+
+For each word you receive, return its common dictionary senses in Simplified Chinese.
+
+Rules:
+- Group senses by part of speech, most common part of speech first.
+- Start every entry with its part-of-speech abbreviation followed by a period: n. v. vt. vi. adj. adv. prep. conj. pron. num. int. abbr.
+- Separate senses inside one entry with "；".
+- At most ${GLOSS_MAX_SENSE_LINES} entries per word, and at most 4 senses inside one entry.
+- Simplified Chinese only. No pinyin, no English, no example sentences, no pronunciation.
+- Return every word you were given, spelled exactly as given.
+
+Do not use any chain-of-thought or reasoning traces. Output only the final JSON.
+
+Return a JSON object with this structure:
+{"items":[{"word":"bush","senses":["n. 灌木；丛林地带；浓密的毛发"]},{"word":"mustard","senses":["n. 芥末酱；芥菜","adj. 芥末黄的，褐黄色的"]}]}`;
+
+  const userPrompt = `Words:\n${words.join("\n")}`;
+
+  const response = await fetch(YTD_SETTINGS.chatCompletionsUrl(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${settings.aiApiKey}`,
+    },
+    body: JSON.stringify({
+      model: settings.aiModel,
+      max_tokens: GLOSS_MAX_TOKENS,
+      temperature: 0.2,
+      // Same rationale as vocabulary extraction: a dictionary lookup does not
+      // need chain-of-thought, and disabling it keeps the export responsive.
+      enable_thinking: false,
+      thinking: { type: "disabled" },
+      messages: [{ role: "user", content: `${systemPrompt}\n\n---\n\n${userPrompt}` }],
+    }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => "");
+    throw new Error(`HTTP ${response.status}: ${errText.slice(0, 200)}`);
+  }
+
+  const data = await response.json();
+  const text = data.choices?.[0]?.message?.content || "";
+  const parsed = parseVocabJson(text);
+  const glosses = new Map();
+  for (const item of parsed?.items || []) {
+    const word = typeof item?.word === "string" ? item.word.trim() : "";
+    const senses = normalizeGlossSenses(item?.senses);
+    if (word && senses.length) glosses.set(word.toLowerCase(), senses);
+  }
+  return glosses;
+}
+
+/**
+ * Builds the printable rows: word plus dictionary sense lines. Cached words
+ * cost nothing, uncached ones go out in batches, and any word still without a
+ * dictionary entry keeps its contextual gloss so the sheet is never blank.
+ */
+async function buildVocabCardItems(items, onProgress) {
+  const cache = await loadGlossCache();
+  const missing = [];
+  const seen = new Set();
+  for (const item of items) {
+    const key = item.word.toLowerCase();
+    if (cache[key] || seen.has(key)) continue;
+    seen.add(key);
+    missing.push(item.word);
+  }
+
+  if (missing.length) {
+    let settings = null;
+    try {
+      const stored = await chrome.storage.local.get(YTD_SETTINGS.STORAGE_KEY);
+      settings = YTD_SETTINGS.normalize(stored[YTD_SETTINGS.STORAGE_KEY]);
+    } catch {
+      settings = null;
+    }
+
+    if (settings?.aiApiKey) {
+      const batches = [];
+      for (let i = 0; i < missing.length; i += GLOSS_BATCH_SIZE) {
+        batches.push(missing.slice(i, i + GLOSS_BATCH_SIZE));
+      }
+      let fetched = 0;
+      let cacheChanged = false;
+      for (const batch of batches) {
+        try {
+          const glosses = await fetchGlossBatch(batch, settings);
+          for (const [key, senses] of glosses) {
+            cache[key] = senses;
+            cacheChanged = true;
+          }
+        } catch (err) {
+          // A failed batch is not fatal: those words fall back to their
+          // contextual gloss and the rest of the sheet still prints.
+          console.warn("[YouTube Digest] Gloss batch failed:", err.message);
+        }
+        fetched += batch.length;
+        if (typeof onProgress === "function") onProgress(fetched, missing.length);
+      }
+      if (cacheChanged) await saveGlossCache(cache);
+    }
+  }
+
+  return items.map((item) => ({
+    word: item.word,
+    chinese: item.chinese,
+    senses: cache[item.word.toLowerCase()] || [],
+  }));
+}
+
+/**
+ * Hands the word list to vocab-cards.html through chrome.storage.session and
+ * opens it in a tab, which renders the sheets and goes straight to the print
+ * dialog so the whole export is one click plus Save as PDF. The payload goes
+ * through session storage rather than the URL because a full list easily
+ * exceeds what a query string can carry.
+ */
+async function exportVocabCards() {
+  const items = currentVocabItems || [];
+  if (!items.length) return;
+
+  const btn = document.getElementById("exportVocabCardsBtn");
+  const status = document.getElementById("vocabStatus");
+  if (btn) { btn.disabled = true; btn.textContent = "Preparing…"; }
+
+  try {
+    const cardItems = await buildVocabCardItems(items, (done, total) => {
+      if (btn) btn.textContent = `Looking up ${done}/${total}…`;
+    });
+
+    if (btn) btn.textContent = "Opening…";
+    const key = `ytd_vocab_cards:${currentVideoId || "unknown"}:${Date.now()}`;
+    await chrome.storage.session.set({
+      [key]: {
+        title: currentVideoTitle || "Vocabulary Cards",
+        videoId: currentVideoId || "",
+        exportDate: new Date().toLocaleDateString(undefined, {
+          year: "numeric", month: "long", day: "numeric",
+        }),
+        items: cardItems,
+      },
+    });
+    await chrome.tabs.create({
+      url: chrome.runtime.getURL(
+        `vocab-cards.html?key=${encodeURIComponent(key)}&print=1`,
+      ),
+    });
+    if (status) status.textContent = "";
+  } catch (err) {
+    console.error("[YouTube Digest] Card export failed:", err);
+    if (status) status.textContent = `Export failed: ${err.message}`;
+  } finally {
+    if (btn) btn.disabled = false;
+    updateVocabExportButton();
+  }
 }
 
 // ============================================================
@@ -2458,6 +2806,9 @@ async function deleteNote(noteId) {
 function startPlaybackTracking() {
   if (!currentTranscript || !currentTranscript.length) return;
 
+  syncFollowPlaybackButton();
+  bindUserScrollIntentListeners();
+
   // Don't restart if already tracking (preserves user's auto-scroll state)
   if (autoScrollInterval) return;
 
@@ -2466,16 +2817,33 @@ function startPlaybackTracking() {
   // appropriate. Switching back to the Transcript tab must not re-enable
   // auto-scroll if the user had already scrolled away.
 
-  document.getElementById("followPlaybackBtn").style.display =
-    autoScrollEnabled ? "none" : "block";
-
   // Poll video time every 500ms
   autoScrollInterval = setInterval(() => playbackTrackingTick(), 500);
+}
 
-  // Listen for manual scrolls on the content area
+/**
+ * The button is only an escape hatch shown while auto-scroll is off. While
+ * following, it stays hidden — following is the state, not a pending action.
+ */
+function syncFollowPlaybackButton() {
+  const button = document.getElementById("followPlaybackBtn");
+  if (button) button.style.display = autoScrollEnabled ? "none" : "block";
+}
+
+/**
+ * Binds the gestures that count as "the user took over scrolling". Bound once
+ * on the content area, which outlives every transcript re-render.
+ */
+function bindUserScrollIntentListeners() {
+  if (userScrollListenersBound) return;
   const contentArea = document.getElementById("contentArea");
-  contentArea.removeEventListener("scroll", onContentAreaScroll);
-  contentArea.addEventListener("scroll", onContentAreaScroll);
+  if (!contentArea) return;
+
+  contentArea.addEventListener("wheel", releaseAutoScroll, { passive: true });
+  contentArea.addEventListener("touchmove", releaseAutoScroll, { passive: true });
+  contentArea.addEventListener("mousedown", onContentAreaPointerDown);
+  contentArea.addEventListener("keydown", onContentAreaKeyDown);
+  userScrollListenersBound = true;
 }
 
 /**
@@ -2487,8 +2855,9 @@ function stopPlaybackTracking() {
     clearInterval(autoScrollInterval);
     autoScrollInterval = null;
   }
-  lastAutoScrollTime = 0;
-  document.getElementById("followPlaybackBtn").style.display = "none";
+  anchorSettleUntil = 0;
+  const followButton = document.getElementById("followPlaybackBtn");
+  if (followButton) followButton.style.display = "none";
 
   // Remove active highlights
   document
@@ -2512,18 +2881,48 @@ async function playbackTrackingTick() {
     if (!result.success || !result.response) return;
 
     const currentTime = result.response.currentTime || 0;
+    lastKnownPlaybackSeconds = currentTime;
     highlightActiveEntry(currentTime);
+    // Keep the translation window moving with playback so the viewer is never
+    // waiting on segments they have already passed.
+    requestTranslationAroundPlayback();
+    // Re-anchor even when the highlight didn't move: rows above the spoken line
+    // change height as translations stream in, which drifts it off-center.
+    if (autoScrollEnabled) keepActiveEntryAnchored();
   } catch (error) {
     // Silently ignore — YouTube tab might be closed or navigated away
   }
 }
 
 /**
+ * Nudges the spoken line back toward the middle of the viewport when it has
+ * drifted past the tolerance. Does nothing while a previous smooth scroll is
+ * still animating, so corrections never stack up and fight each other.
+ */
+function keepActiveEntryAnchored() {
+  if (Date.now() < anchorSettleUntil) return;
+
+  const contentArea = document.getElementById("contentArea");
+  const activeEntry = document.querySelector(
+    "#transcriptList .transcript-entry.active-playback",
+  );
+  if (!contentArea || !activeEntry) return;
+
+  const viewport = contentArea.getBoundingClientRect();
+  const row = activeEntry.getBoundingClientRect();
+  const drift =
+    (row.top + row.height / 2) - (viewport.top + viewport.height / 2);
+  if (Math.abs(drift) <= ANCHOR_TOLERANCE_PX) return;
+
+  anchorSettleUntil = Date.now() + ANCHOR_SETTLE_MS;
+  activeEntry.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+/**
  * Scrolls the transcript to the entry currently being spoken (the one
  * carrying the active-playback highlight). Returns false if nothing is
- * highlighted yet. Stamps lastAutoScrollTime BEFORE scrolling so the scroll
- * events from our own smooth animation aren't mistaken for the user
- * scrolling away (which would re-disable auto-scroll immediately).
+ * highlighted yet. Opens a settle window so the drift check doesn't fire
+ * again while this animation is still running.
  */
 function scrollToActiveEntry() {
   const activeEntry = document.querySelector(
@@ -2531,7 +2930,7 @@ function scrollToActiveEntry() {
   );
   if (!activeEntry) return false;
 
-  lastAutoScrollTime = Date.now();
+  anchorSettleUntil = Date.now() + ANCHOR_SETTLE_MS;
   activeEntry.scrollIntoView({ behavior: "smooth", block: "center" });
   return true;
 }
@@ -2565,39 +2964,83 @@ function highlightActiveEntry(currentSeconds) {
 
   if (!activeEntry) return;
 
-  // Skip if this entry is already highlighted (no DOM thrashing)
-  if (activeEntry.classList.contains("active-playback")) return;
+  const moved = !activeEntry.classList.contains("active-playback");
+  if (moved) {
+    // Remove old highlight, add new one
+    entries.forEach((e) => e.classList.remove("active-playback"));
+    activeEntry.classList.add("active-playback");
+  }
 
-  // Remove old highlight, add new one
-  entries.forEach((e) => e.classList.remove("active-playback"));
-  activeEntry.classList.add("active-playback");
+  if (!autoScrollEnabled) return;
 
-  // Only scroll if auto-scroll is enabled.
-  if (autoScrollEnabled) {
-    lastAutoScrollTime = Date.now();
-    // On re-render (tab switch / cache reload), jump instantly to the current
-    // playback row without the smooth animation. After the first jump, revert
-    // to smooth follow-along.
-    const scrollBehavior = jumpNextHighlightWithoutAnimation ? "instant" : "smooth";
-    activeEntry.scrollIntoView({ behavior: scrollBehavior, block: "center" });
+  // On re-render (tab switch / cache reload), jump instantly to the current
+  // playback row without the smooth animation. After the first jump, revert
+  // to smooth follow-along.
+  if (jumpNextHighlightWithoutAnimation) {
     jumpNextHighlightWithoutAnimation = false;
+    anchorSettleUntil = 0;
+    activeEntry.scrollIntoView({ behavior: "instant", block: "center" });
+    return;
+  }
+
+  if (moved) {
+    anchorSettleUntil = Date.now() + ANCHOR_SETTLE_MS;
+    activeEntry.scrollIntoView({ behavior: "smooth", block: "center" });
   }
 }
 
 /**
- * Scroll event handler for the content area.
- * Detects manual scrolling and disables auto-scroll so the user
- * can read at their own pace without being yanked back.
+ * Hands scrolling back to the user. Called only from real input gestures —
+ * never from scroll events, which our own smooth animation also fires.
  */
-function onContentAreaScroll() {
-  // Ignore scroll events within 1 second of a programmatic scroll
-  // (smooth scroll animations can last longer than a simple boolean flag)
-  if (Date.now() - lastAutoScrollTime < 1000) return;
+function releaseAutoScroll() {
+  if (!autoScrollEnabled || !autoScrollInterval) return;
+  autoScrollEnabled = false;
+  anchorSettleUntil = 0;
+  syncFollowPlaybackButton();
+}
 
-  // User scrolled manually — disable auto-scroll and show the button
-  if (autoScrollEnabled && autoScrollInterval) {
-    autoScrollEnabled = false;
-    document.getElementById("followPlaybackBtn").style.display = "block";
+/**
+ * A press on the scrollbar gutter (past the content edge) is a drag-to-scroll,
+ * so it releases following. Clicks inside the transcript are seeks and must not.
+ */
+function onContentAreaPointerDown(event) {
+  if (event.button !== 0) return;
+  // clientWidth excludes the scrollbar, so a press to the right of it is on
+  // the scrollbar itself regardless of which child element was under it.
+  const contentArea = event.currentTarget;
+  const rect = contentArea.getBoundingClientRect();
+  if (event.clientX > rect.left + contentArea.clientWidth) releaseAutoScroll();
+}
+
+/** True for anything that consumes typing keys itself, such as the note editor. */
+function isTextEntryTarget(target) {
+  if (!target || target.nodeType !== 1) return false;
+  const tag = target.tagName;
+  return (
+    tag === "TEXTAREA" ||
+    tag === "INPUT" ||
+    tag === "SELECT" ||
+    target.isContentEditable === true
+  );
+}
+
+/**
+ * Whether a keypress inside the content area was the user scrolling. The event
+ * can bubble up from any focused descendant, so the target decides: in a text
+ * field these keys are typing, and Space on a focused control activates it —
+ * only the scroll container itself scrolls on Space.
+ */
+function isScrollIntentKey(key, target, container) {
+  if (!SCROLL_INTENT_KEYS.has(key)) return false;
+  if (isTextEntryTarget(target)) return false;
+  if (key === " " && target !== container) return false;
+  return true;
+}
+
+function onContentAreaKeyDown(event) {
+  if (isScrollIntentKey(event.key, event.target, event.currentTarget)) {
+    releaseAutoScroll();
   }
 }
 
@@ -2874,14 +3317,28 @@ async function translateTranscript() {
   const rows = renderTranscriptModeRows(segments, mode);
   const queue = [];
   const queued = new Set();
+  const inFlight = new Set();
   let processing = false;
 
   const processNext = async () => {
     if (processing || queue.length === 0 || generation !== translationGeneration)
       return;
     processing = true;
-    const indices = queue.splice(0, 3);
-    indices.forEach((index) => queued.delete(index));
+    // Batches are cut at dispatch time, so a segment promoted while an earlier
+    // batch was in flight goes out in the very next request. Segments that got
+    // cached while waiting (e.g. by an overlapping batch) are dropped here.
+    const indices = queue.splice(0, 3).filter((index) => {
+      queued.delete(index);
+      return !transcriptParagraphCache.has(
+        transcriptTranslationCacheKey(segments[index]),
+      );
+    });
+    if (!indices.length) {
+      processing = false;
+      if (queue.length && generation === translationGeneration) processNext();
+      return;
+    }
+    indices.forEach((index) => inFlight.add(index));
     try {
       await requestTranscriptTranslationBatch(
         indices,
@@ -2891,24 +3348,37 @@ async function translateTranscript() {
         mode,
       );
     } finally {
+      indices.forEach((index) => inFlight.delete(index));
       processing = false;
       if (queue.length && generation === translationGeneration) processNext();
     }
   };
 
-  const enqueue = (index, force = false) => {
+  // priority=true puts the segment at the head of the queue: playback-window
+  // work must not wait behind whatever the viewport queued earlier.
+  const enqueue = (index, force = false, priority = false) => {
     if (!Number.isInteger(index) || !segments[index]) return;
+    if (inFlight.has(index)) return;
     const cached = transcriptParagraphCache.has(
       transcriptTranslationCacheKey(segments[index]),
     );
-    if ((!force && cached) || queued.has(index)) return;
-    queue.push(index);
-    queued.add(index);
+    if (!force && cached) return;
+    if (queued.has(index)) {
+      if (!priority) return;
+      // Already waiting, but now it is on-screen for playback — move it up.
+      const position = queue.indexOf(index);
+      if (position > 0) queue.splice(position, 1);
+      else return;
+    } else {
+      queued.add(index);
+    }
+    if (priority) queue.unshift(index);
+    else queue.push(index);
     // Let all entries reported in the same viewport turn collect before the
     // worker starts, producing one small contextual multi-segment request.
     Promise.resolve().then(processNext);
   };
-  activeTranslationQueue = { enqueue };
+  activeTranslationQueue = { enqueue, segments, generation };
 
   transcriptScrollObserver = new IntersectionObserver(
     (observerEntries) => {
@@ -2928,10 +3398,55 @@ async function translateTranscript() {
     },
   );
 
-  rows.forEach((row, index) => {
+  rows.forEach((row) => {
     if (!row.classList.contains("translated")) transcriptScrollObserver.observe(row);
-    if (index < 3) enqueue(index);
   });
+
+  // Seed from wherever playback is, not from the top of the video. On a fresh
+  // load lastKnownPlaybackSeconds is 0, which naturally seeds the opening.
+  requestTranslationAroundPlayback();
+}
+
+/**
+ * Queues the segments around the current playback position ahead of everything
+ * else, so the line being spoken is translated first and the viewer is not
+ * waiting for a sweep that started at the beginning of the video.
+ */
+function requestTranslationAroundPlayback() {
+  if (!activeTranslationQueue) return;
+  if (currentTranscriptMode === "original") return;
+  const { enqueue, segments, generation } = activeTranslationQueue;
+  if (generation !== translationGeneration || !segments?.length) return;
+
+  const active = findSegmentIndexForTime(segments, lastKnownPlaybackSeconds);
+  if (active === -1) return;
+
+  const first = Math.max(0, active - TRANSLATION_LOOKBEHIND_SEGMENTS);
+  const last = Math.min(
+    segments.length - 1,
+    active + TRANSLATION_LOOKAHEAD_SEGMENTS,
+  );
+
+  // Walk outward from the spoken segment so the closest lines land first, and
+  // unshift in reverse so the final queue order runs forward through the window.
+  const window = [];
+  for (let index = active; index <= last; index += 1) window.push(index);
+  for (let index = active - 1; index >= first; index -= 1) window.push(index);
+  window.reverse().forEach((index) => enqueue(index, false, true));
+}
+
+/**
+ * Index of the segment whose time range contains the given second, or -1 when
+ * the segment list is empty. Times before the first segment resolve to it.
+ */
+function findSegmentIndexForTime(segments, seconds) {
+  if (!segments.length) return -1;
+  let match = 0;
+  for (let index = 0; index < segments.length; index += 1) {
+    if (segments[index].start <= seconds) match = index;
+    else break;
+  }
+  return match;
 }
 
 function setTranslatingSpinner(show) {
@@ -2951,4 +3466,11 @@ globalThis.__YTD_TRANSCRIPT_TESTING__ = {
   alignTranslatedSegmentBatch,
   renderSubtitleInlineMarkup,
   renderTranscriptSegmentContent,
+  findSegmentIndexForTime,
+  isScrollIntentKey,
+  isTextEntryTarget,
+  normalizeGlossLine,
+  normalizeGlossSenses,
+  fetchGlossBatch,
+  buildVocabCardItems,
 };

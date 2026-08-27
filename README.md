@@ -103,6 +103,7 @@ Keys and settings are stored in Chrome's local extension storage on your device.
 - Native subtitle tracks returned by Supadata. YouTube Digest prefers English when available, but may show another native language.
 - Original, Simplified Chinese, and aligned bilingual transcript views.
 - AI overviews, selected-text explanations, translation, and automatic note polishing.
+- Vocabulary extraction with dictionary glosses, exported as printable A4 dictation sheets (Save as PDF).
 - Local notes and a local cache for recent transcript and digest results.
 - DeepSeek V4 Flash (0731) via TokenDance for all published AI features. Other providers require a local code adaptation and are not supported by this published version.
 
@@ -148,7 +149,6 @@ YouTube Digest uses plain HTML, CSS, and JavaScript with no build step, so it is
 
 - Add more translation languages and let each person choose a learning language.
 - Create customized summary templates for lectures, interviews, tutorials, reviews, or research talks.
-- Build a vocabulary notebook that saves a word, its sentence, meaning, and video timestamp.
 - Export notes and vocabulary to Markdown, CSV, Anki, or another study tool.
 - Add personal topic filters that highlight the chapters most relevant to a goal.
 - Add optional local-model support for a different privacy and cost tradeoff.
