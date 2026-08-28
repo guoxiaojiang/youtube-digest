@@ -18,9 +18,22 @@
 // left slightly short so a font substitution cannot push a row over the edge.
 const SHEET_BODY_MM = 236;
 const ROW_BASE_MM = 5.1;
-const MEANING_LINE_MM = 4.3;
+const MEANING_LINE_MM = 4.9;
 // Pure safety net: with the budget above this is never the binding limit.
 const MAX_ROWS_PER_SHEET = 30;
+
+// A sense too long for the meaning column wraps, so it prints as two lines
+// while `senses` still counts it as one. The column is 28.5% of the 187mm
+// print content width less its cell padding; a full-width CJK glyph at
+// 11.5px is about 3.04mm, and Latin letters average a little over half that.
+const MEANING_CHARS_PER_LINE = 15;
+const LATIN_CHAR_WEIGHT = 0.55;
+
+// Printable area of one A4 page, matching the @page rule in vocab-cards.html.
+const PAGE_HEIGHT_MM = 297;
+const PAGE_MARGIN_MM = 11.5;
+// Absorbs sub-pixel rounding between our measurement and the print layout.
+const PAGE_SAFETY_MM = 5;
 
 // Inline so the saved standalone file stays self-contained and the print
 // stylesheet never waits on a network request.
@@ -44,23 +57,40 @@ function sanitizeFilename(str) {
     .toLowerCase();
 }
 
+/**
+ * How many printed lines one sense occupies. CJK glyphs are full-width and
+ * Latin ones roughly half, so the two are weighted rather than counted alike.
+ */
+const FULL_WIDTH_CHAR = /[　-〿㐀-鿿＀-￯]/;
+
+function senseLineCount(text) {
+  let width = 0;
+  for (const char of String(text)) {
+    width += FULL_WIDTH_CHAR.test(char) ? 1 : LATIN_CHAR_WEIGHT;
+  }
+  return Math.max(1, Math.ceil(width / MEANING_CHARS_PER_LINE));
+}
+
 /** Estimated printed height of one word's row, in millimetres. */
 function rowHeightMm(item) {
-  const lines = Math.max(1, meaningLines(item).length);
-  return ROW_BASE_MM + lines * MEANING_LINE_MM;
+  const senses = meaningLines(item);
+  const lines = senses.reduce((total, line) => total + senseLineCount(line), 0);
+  return ROW_BASE_MM + Math.max(1, lines) * MEANING_LINE_MM;
 }
 
 /**
  * Groups words into sheets that each fill about one page. A word too tall for
  * an empty sheet still gets its own sheet rather than being dropped.
  */
-function paginate(items) {
+function paginate(items, options = {}) {
+  const costOf = options.costOf || rowHeightMm;
+  const budget = options.budget > 0 ? options.budget : SHEET_BODY_MM;
   const pages = [];
   let page = [];
   let used = 0;
   for (const item of items) {
-    const cost = rowHeightMm(item);
-    if (page.length && (used + cost > SHEET_BODY_MM || page.length >= MAX_ROWS_PER_SHEET)) {
+    const cost = costOf(item);
+    if (page.length && (used + cost > budget || page.length >= MAX_ROWS_PER_SHEET)) {
       pages.push(page);
       page = [];
       used = 0;
@@ -135,8 +165,82 @@ function renderGrid(rows, startIndex) {
     </table>`;
 }
 
+/**
+ * Millimetres per CSS pixel, read from the document instead of assuming 96dpi.
+ */
+function mmPerPx(doc) {
+  const probe = doc.createElement("div");
+  probe.style.cssText =
+    "position:absolute;visibility:hidden;height:100mm;width:0;padding:0;border:0;";
+  doc.body.appendChild(probe);
+  const px = probe.getBoundingClientRect().height;
+  probe.remove();
+  return px > 0 ? 100 / px : 0;
+}
+
+const samePagination = (a, b) =>
+  a.length === b.length && a.every((page, i) => page.length === b[i].length);
+
+/**
+ * Re-paginates using the heights the browser actually produced.
+ *
+ * The estimate in rowHeightMm cannot know the real wrap points, and when a sheet
+ * ends up taller than one physical page the `page-break-after: always` on
+ * `.sheet` pushes only the overflow onto the next page — printing one orphan row
+ * followed by most of a page of white space. Measuring the rendered rows and
+ * splitting against the true printable height removes that case; the estimate
+ * stays as the first pass so the common path renders once.
+ */
+function repaginateFromMeasurements(container, items, estimated, renderPages) {
+  const doc = container.ownerDocument;
+  const scale = mmPerPx(doc);
+  if (!scale) return null;
+
+  const heightMm = (el) => (el ? el.getBoundingClientRect().height * scale : 0);
+
+  const rows = Array.from(container.querySelectorAll(".grid tbody tr"));
+  if (rows.length !== items.length) return null;
+
+  // Rows measure the same on screen as in print: the table is 186mm wide inside
+  // the screen sheet's padding, and 186mm inside the print page's content area.
+  // The sheet element itself does not — `min-height: 297mm` and its 14mm
+  // vertical padding are both dropped under @media print — so the page budget is
+  // derived from the @page rule rather than read off the rendered sheet.
+  const measured = new Map();
+  rows.forEach((row, i) => measured.set(items[i], heightMm(row)));
+
+  const overhead = Array.from(container.querySelectorAll(".sheet")).reduce(
+    (worst, sheet) =>
+      Math.max(
+        worst,
+        heightMm(sheet.querySelector(".sheet-head")) +
+          heightMm(sheet.querySelector(".grid thead")),
+      ),
+    0,
+  );
+
+  const budget =
+    PAGE_HEIGHT_MM - PAGE_MARGIN_MM * 2 - PAGE_SAFETY_MM - overhead;
+  if (budget <= 0) return null;
+
+  const pages = paginate(items, {
+    budget,
+    costOf: (item) => measured.get(item) ?? rowHeightMm(item),
+  });
+  if (samePagination(pages, estimated)) return null;
+  renderPages(pages);
+  return pages;
+}
+
 function renderSheets(container, { title, items, exportDate }) {
-  const pages = paginate(items);
+  const renderPages = (pages) =>
+    renderPageSections(container, pages, { title, items, exportDate });
+  const estimated = paginate(items);
+  renderPages(estimated);
+  repaginateFromMeasurements(container, items, estimated, renderPages);
+}
+
+function renderPageSections(container, pages, { title, items, exportDate }) {
   let startIndex = 0;
   container.innerHTML = pages
     .map((rows) => {
@@ -269,9 +373,14 @@ globalThis.__YTD_VOCAB_CARDS_TESTING__ = {
   paginate,
   rowHeightMm,
   renderRow,
+  renderSheets,
+  repaginateFromMeasurements,
   sanitizeFilename,
   SHEET_BODY_MM,
   MAX_ROWS_PER_SHEET,
+  PAGE_HEIGHT_MM,
+  PAGE_MARGIN_MM,
+  PAGE_SAFETY_MM,
   downloadStandalone,
   DOWNLOAD_SUBFOLDER,
 };

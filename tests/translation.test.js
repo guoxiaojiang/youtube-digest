@@ -425,8 +425,74 @@ test("provider idle silence aborts with a distinct Retry-able error", async () =
   const result = await request;
   assert.equal(result.success, false);
   assert.equal(result.code, "AI_IDLE_TIMEOUT");
-  assert.match(result.error, /inactive for 50 seconds.*Retry/i);
+  // A request that never produced a byte is a first-token stall, not a
+  // mid-answer stall. Same budget for non-streaming calls, clearer wording.
+  assert.match(result.error, /produced no output for 50 seconds.*Retry/i);
   assert.equal(timers.activeCount(120_000), 0);
+});
+
+test("a stream that starts then stalls switches to the tighter idle budget", async () => {
+  const timers = createFakeTimers();
+  let releaseRead = () => {};
+  let reads = 0;
+  const helpers = loadBackgroundHelpers({
+    setTimeoutImpl: timers.setTimeout,
+    clearTimeoutImpl: timers.clearTimeout,
+    fetchImpl: async (_url, { signal }) => ({
+      ok: true,
+      status: 200,
+      body: {
+        getReader: () => ({
+          read: () =>
+            new Promise((resolve, reject) => {
+              signal.addEventListener("abort", () => {
+                const error = new Error("aborted");
+                error.name = "AbortError";
+                reject(error);
+              });
+              // First read delivers a delta; every read after that hangs, so
+              // the stall happens after the stream has already started.
+              if (reads++ === 0) {
+                resolve({
+                  done: false,
+                  value: new TextEncoder().encode(
+                    `data: ${JSON.stringify({ choices: [{ delta: { content: "农村的" } }] })}\n\n`,
+                  ),
+                });
+              } else {
+                releaseRead = () => resolve({ done: true });
+              }
+            }),
+        }),
+      },
+    }),
+  });
+
+  const deltas = [];
+  const request = helpers.requestAiCompletion({
+    messages: [{ role: "user", content: "Explain." }],
+    stream: true,
+    onDelta: (delta) => deltas.push(delta),
+  });
+  await nextTurn();
+  await nextTurn();
+
+  assert.deepEqual(deltas, ["农村的"], "the first delta must reach the caller");
+  // The first-token timer and the hard cap share a 120s delay, so after the
+  // first delta retires the former, exactly one 120s timer (the hard cap)
+  // remains alongside the freshly armed 45s mid-stream timer.
+  assert.equal(timers.activeCount(120_000), 1);
+  assert.equal(timers.activeCount(45_000), 1);
+
+  timers.fireActive(45_000);
+  const error = await request.then(
+    () => null,
+    (err) => err,
+  );
+  assert.ok(error, "a stalled stream must reject");
+  assert.equal(error.code, "AI_IDLE_TIMEOUT");
+  assert.match(error.message, /inactive for 45 seconds.*Retry/i);
+  releaseRead();
 });
 
 test("blank-line keepalives cannot evade the provider hard cap", async () => {

@@ -61,10 +61,10 @@ For QUOTES: Find the line containing the quote, use that line's timestamp
 Output JSON (no markdown fences):
 {
   "chapters": [
-    {"title": "Title", "timestamp": "0:00", "timestampSeconds": 0, "summary": "What this section covers"}
+    {"title": "Title", "titleZh": "中文标题", "timestamp": "0:00", "timestampSeconds": 0, "summary": "What this section covers", "summaryZh": "这一节讲了什么"}
   ],
   "keyQuotes": [
-    {"quote": "Exact quote from transcript", "timestamp": "2:30", "timestampSeconds": 150}
+    {"quote": "Exact quote from transcript", "quoteZh": "这句话的中文意思", "timestamp": "2:30", "timestampSeconds": 150}
   ],
   "keyMoments": [0, 150, 300]
 }
@@ -74,6 +74,13 @@ CRITICAL:
 - timestampSeconds: Convert to seconds (2:30 = 2*60+30 = 150)
 - NEVER use 0:00/0 unless the content actually starts at [0:00]
 - EVERY timestamp must exist in the transcript — look it up!
+
+CHINESE FIELDS (titleZh, summaryZh, quoteZh):
+- Write natural, colloquial Simplified Chinese — convey the meaning, do not translate word by word
+- Keep proper nouns, product names, and technical terms in English
+- Put a space between Chinese and English/numbers (例如：用 React 重写)
+- quoteZh conveys what the speaker means, not a literal gloss
+- Never leave these empty — every chapter and quote needs its Chinese version
 ```
 
 ## User prompt

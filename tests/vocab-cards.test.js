@@ -36,6 +36,48 @@ function loadCardHelpers() {
 }
 
 /**
+ * Loads the card helpers against a DOM that reports heights, so the
+ * measure-and-repaginate pass can run. The probe is 100px tall for a 100mm
+ * request, making 1px == 1mm and letting the fixtures below be written in mm.
+ */
+function loadMeasureHelpers() {
+  const sandbox = {
+    console,
+    document: {
+      body: { appendChild() {} },
+      getElementById: () => null,
+      createElement: () => ({
+        style: {},
+        getBoundingClientRect: () => ({ height: 100 }),
+        remove() {},
+      }),
+    },
+  };
+  sandbox.globalThis = sandbox;
+  vm.runInNewContext(read("vocab-cards.js"), sandbox);
+  return { helpers: sandbox.__YTD_VOCAB_CARDS_TESTING__, doc: sandbox.document };
+}
+
+/**
+ * Container stand-in whose rows report `rowMm` each and whose sheet chrome
+ * reports `headMm` + `theadMm`, regardless of what was rendered into it.
+ */
+function measuringContainer(doc, { rowCount, rowMm, headMm = 10, theadMm = 8 }) {
+  const box = (height) => ({ getBoundingClientRect: () => ({ height }) });
+  const sheet = {
+    querySelector: (sel) => (sel === ".sheet-head" ? box(headMm) : box(theadMm)),
+  };
+  return {
+    ownerDocument: doc,
+    set innerHTML(_html) {},
+    querySelectorAll: (sel) =>
+      sel === ".sheet"
+        ? [sheet]
+        : Array.from({ length: rowCount }, () => box(rowMm)),
+  };
+}
+
+/**
  * Loads the card helpers with enough of a page to run downloadStandalone.
  * `downloads` is the chrome.downloads stub; pass null to drop the API entirely
  * and exercise the anchor fallback.
@@ -191,6 +233,93 @@ test("sheets are packed by estimated height, not by row count", () => {
     const used = page.reduce((sum, item) => sum + rowHeightMm(item), 0);
     assert.ok(used <= SHEET_BODY_MM, `sheet over budget: ${used}mm`);
   }
+});
+
+test("a sense too wide for the meaning column is budgeted as more than one line", () => {
+  const { rowHeightMm } = loadCardHelpers();
+  const short = rowHeightMm({ word: "clue", senses: ["n. 线索"] });
+  const wrapping = rowHeightMm({
+    word: "legitimacy",
+    senses: ["n. 合法性；正当性；合理性；正统性；婚生；嫡出"],
+  });
+  assert.ok(
+    wrapping > short,
+    "a long gloss must cost more than a short one even though both are one sense",
+  );
+  // Latin text is roughly half-width, so it wraps later than the same count of CJK.
+  const latin = rowHeightMm({ word: "x", senses: ["a".repeat(20)] });
+  const cjk = rowHeightMm({ word: "x", senses: ["中".repeat(20)] });
+  assert.ok(cjk > latin, "CJK glyphs are full-width and must cost more per character");
+});
+
+test("a sheet taller than one printed page is split instead of overflowing", () => {
+  const { helpers, doc } = loadMeasureHelpers();
+  const { repaginateFromMeasurements, PAGE_HEIGHT_MM, PAGE_MARGIN_MM, PAGE_SAFETY_MM } = helpers;
+
+  // 40 rows at 8mm is 320mm of body — far past one A4 page. Before the fix this
+  // stayed a single .sheet, and page-break-after pushed the overflow onto a
+  // second physical page as one orphan row plus a page of white space.
+  const items = Array.from({ length: 40 }, (_, i) => single(`w${i}`));
+  const estimated = [items];
+  const rowMm = 8;
+  const headMm = 10;
+  const theadMm = 8;
+  const container = measuringContainer(doc, { rowCount: items.length, rowMm, headMm, theadMm });
+
+  const rendered = [];
+  const pages = host(
+    repaginateFromMeasurements(container, items, estimated, (p) => rendered.push(host(p))),
+  );
+
+  assert.equal(rendered.length, 1, "the corrected pagination must be re-rendered once");
+  assert.ok(pages.length > 1, "the oversized sheet must be split");
+
+  const budget =
+    PAGE_HEIGHT_MM - PAGE_MARGIN_MM * 2 - PAGE_SAFETY_MM - headMm - theadMm;
+  for (const page of pages) {
+    assert.ok(
+      host(page).length * rowMm <= budget,
+      `sheet exceeds the printable area: ${host(page).length * rowMm}mm > ${budget}mm`,
+    );
+  }
+  // Splitting must not lose or reorder anything.
+  const flattened = pages.flatMap((page) => host(page));
+  assert.deepEqual(
+    flattened.map((item) => item.word),
+    items.map((item) => item.word),
+  );
+});
+
+test("measurement leaves the estimated pagination alone when it already fits", () => {
+  const { helpers, doc } = loadMeasureHelpers();
+  const items = Array.from({ length: 10 }, (_, i) => single(`w${i}`));
+  const container = measuringContainer(doc, { rowCount: items.length, rowMm: 8 });
+
+  let rerenders = 0;
+  const result = helpers.repaginateFromMeasurements(
+    container,
+    items,
+    [items],
+    () => (rerenders += 1),
+  );
+
+  assert.equal(result, null, "an unchanged pagination must report no correction");
+  assert.equal(rerenders, 0, "the common case must render exactly once");
+});
+
+test("measurement backs off when the DOM does not match the items", () => {
+  const { helpers, doc } = loadMeasureHelpers();
+  const items = Array.from({ length: 10 }, (_, i) => single(`w${i}`));
+  // A row count that disagrees with the item count means something else rendered
+  // the page; falling back to the estimate beats mis-mapping heights onto words.
+  const container = measuringContainer(doc, { rowCount: 3, rowMm: 8 });
+
+  let rerenders = 0;
+  assert.equal(
+    helpers.repaginateFromMeasurements(container, items, [items], () => (rerenders += 1)),
+    null,
+  );
+  assert.equal(rerenders, 0);
 });
 
 test("pagination keeps every word and preserves order", () => {

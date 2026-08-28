@@ -35,6 +35,7 @@ let errorAction = null;
 // --- Vocabulary state ---
 let currentVocabItems = null;
 let isVocabLoading = false;
+let explainRequestId = null; // Discards deltas from a superseded Explain request.
 
 // --- Translation state ---
 // The public transcript control intentionally supports only the original
@@ -619,6 +620,13 @@ async function startDigest(videoId, videoUrl) {
     // display immediately without queuing fresh API calls.
     const session = await loadSessionState(currentOwnerTabId, videoId);
     if (session) {
+      // Restore the user's chosen transcript view (original / zh / bilingual)
+      // so a side-panel reload after tab/app switching doesn't silently fall
+      // back to the original-language default.
+      if (["original", "zh", "bilingual"].includes(session.transcriptMode)) {
+        currentTranscriptMode = session.transcriptMode;
+        setTranscriptModeButtons(session.transcriptMode);
+      }
       for (const [key, value] of Object.entries(session.translations || {})) {
         transcriptParagraphCache.set(key, value);
       }
@@ -756,7 +764,9 @@ function renderAnalysisResults(analysis) {
       <span class="chapter-timestamp">${escapeHtml(chapter.timestamp)}</span>
       <div class="chapter-content">
         <span class="chapter-title">${escapeHtml(chapter.title)}</span>
+        ${chapter.titleZh ? `<span class="chapter-title-zh">${escapeHtml(chapter.titleZh)}</span>` : ""}
         <span class="chapter-summary">${escapeHtml(chapter.summary || "")}</span>
+        ${chapter.summaryZh ? `<span class="chapter-summary-zh">${escapeHtml(chapter.summaryZh)}</span>` : ""}
       </div>
     `;
     li.addEventListener("click", () => {
@@ -782,6 +792,7 @@ function renderAnalysisResults(analysis) {
     div.dataset.seconds = quote.timestampSeconds;
     div.innerHTML = `
       <div class="quote-text">${escapeHtml(quote.quote)}</div>
+      ${quote.quoteZh ? `<div class="quote-text-zh">${escapeHtml(quote.quoteZh)}</div>` : ""}
       <div class="quote-meta">
         <span class="quote-timestamp">${escapeHtml(quote.timestamp)}</span>
         <div class="quote-actions">
@@ -1416,8 +1427,9 @@ async function triggerAnalysis() {
     });
 
     if (!analysisResult.success) {
-      if (chapterList)
-        chapterList.innerHTML = `<li class="chapter-item" style="color: var(--accent); border: none;">Analysis failed: ${escapeHtml(analysisResult.error || "Unknown error")}</li>`;
+      showAnalysisError(
+        `Analysis failed: ${analysisResult.error || "Unknown error"}`,
+      );
       isAnalysisLoading = false;
       return;
     }
@@ -1430,11 +1442,25 @@ async function triggerAnalysis() {
     await saveToCache(currentVideoId);
   } catch (error) {
     console.error("[YouTube Digest Panel] Analysis error:", error);
-    if (chapterList)
-      chapterList.innerHTML = `<li class="chapter-item" style="color: var(--accent); border: none;">Error: ${escapeHtml(error.message)}</li>`;
+    showAnalysisError(`Error: ${error.message}`);
   }
 
   isAnalysisLoading = false;
+}
+
+/**
+ * Chapters and quotes come from one request, so a failure has to clear BOTH
+ * placeholders. Leaving "Loading quotes..." under the error message reads as a
+ * half-finished request that is still running, and the Retry hint below it is
+ * the only way back — clearing just one panel hides that.
+ */
+function showAnalysisError(message) {
+  const chapterList = document.getElementById("chapterList");
+  const quotesList = document.getElementById("quotesList");
+  if (chapterList)
+    chapterList.innerHTML = `<li class="chapter-item analysis-error">${escapeHtml(message)}</li>`;
+  if (quotesList)
+    quotesList.innerHTML = `<div class="quote-item analysis-error">Not loaded — reopen the Overview tab to retry.</div>`;
 }
 
 // ============================================================
@@ -2423,6 +2449,7 @@ async function showExplanation(selectedText) {
           <span>Analyzing...</span>
         </div>
       </div>
+      <div class="explain-modal-footer" id="explainFooter"></div>
     </div>
   `;
 
@@ -2439,6 +2466,20 @@ async function showExplanation(selectedText) {
   // Get some context around the selection from the transcript
   const transcriptContext = getTranscriptContext(selectedText);
 
+  // Tags this request so late deltas from an earlier selection are ignored.
+  const requestId = `explain-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  explainRequestId = requestId;
+
+  const onProgress = (message) => {
+    if (message?.action !== "explainProgress") return;
+    if (message.requestId !== explainRequestId) return;
+    if (!message.chinese && !message.english) return;
+    const div = document.getElementById("explanationContent");
+    if (!div || !document.getElementById("explainModal")) return;
+    div.innerHTML = renderExplanationBody(message);
+  };
+  chrome.runtime.onMessage.addListener(onProgress);
+
   // Fetch explanation
   try {
     const result = await chrome.runtime.sendMessage({
@@ -2446,23 +2487,183 @@ async function showExplanation(selectedText) {
       selectedText: selectedText,
       transcriptContext: transcriptContext,
       videoTitle: currentVideoTitle,
+      requestId,
     });
 
+    if (explainRequestId !== requestId) return;
     const contentDiv = document.getElementById("explanationContent");
+    if (!contentDiv) return;
     if (result.success) {
-      contentDiv.innerHTML = `<div class="explain-text">${escapeHtml(result.explanation).replace(/\n\n/g, "</p><p>").replace(/\n/g, "<br>")}</div>`;
+      contentDiv.innerHTML = renderExplanationBody(result);
+      // Only offered once the gloss exists, since the card stores it.
+      setupAddToVocabButton(selectedText, result);
     } else {
       contentDiv.innerHTML = `<div class="explain-error">Failed to get explanation: ${escapeHtml(result.error)}</div>`;
     }
   } catch (error) {
     const contentDiv = document.getElementById("explanationContent");
-    contentDiv.innerHTML = `<div class="explain-error">Error: ${escapeHtml(error.message)}</div>`;
+    if (contentDiv) {
+      contentDiv.innerHTML = `<div class="explain-error">Error: ${escapeHtml(error.message)}</div>`;
+    }
+  } finally {
+    chrome.runtime.onMessage.removeListener(onProgress);
   }
+}
+
+/**
+ * Recovers the two sections from a JSON-shaped explanation, for models that
+ * answer with an object even though the prompt asks for marker-delimited text.
+ *
+ * @param {string} text
+ * @returns {{chinese: string, english: string}|null} null when not JSON-shaped
+ */
+function salvageExplanationJson(text) {
+  if (!text || !text.trim().startsWith("{")) return null;
+  try {
+    const parsed = JSON.parse(text);
+    const chinese = typeof parsed?.chinese === "string" ? parsed.chinese.trim() : "";
+    const english = typeof parsed?.english === "string" ? parsed.english.trim() : "";
+    if (!chinese && !english) return null;
+    return { chinese, english };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Builds the modal body: the Simplified Chinese meaning first, then the English
+ * explanation. Falls back to the combined `explanation` string when the model
+ * did not return the split shape.
+ */
+function renderExplanationBody(result) {
+  const toParagraphs = (text) =>
+    escapeHtml(text).replace(/\n\n/g, "</p><p>").replace(/\n/g, "<br>");
+
+  let chinese = (result.chinese || "").trim();
+  let english = (result.english || "").trim();
+
+  if (!chinese && !english) {
+    const fallback = (result.explanation || "").trim();
+    // Last resort: a model that answers in JSON despite the prompt must not put
+    // braces on screen, so salvage the fields instead of printing the wrapper.
+    const salvaged = salvageExplanationJson(fallback);
+    if (salvaged) {
+      chinese = salvaged.chinese;
+      english = salvaged.english;
+    } else {
+      return `<div class="explain-text">${toParagraphs(fallback)}</div>`;
+    }
+  }
+
+  const sections = [];
+  if (chinese) {
+    sections.push(`
+      <div class="explain-section">
+        <div class="explain-section-label">中文</div>
+        <div class="explain-text explain-text-zh">${toParagraphs(chinese)}</div>
+      </div>
+    `);
+  }
+  if (english) {
+    sections.push(`
+      <div class="explain-section">
+        <div class="explain-section-label">English</div>
+        <div class="explain-text">${toParagraphs(english)}</div>
+      </div>
+    `);
+  }
+  return sections.join("");
 }
 
 /**
  * Gets surrounding context from the transcript for the selected text.
  */
+/**
+ * A vocab card is only worth making for a word or a short phrase. A whole
+ * sentence or paragraph selection has no single headword to file it under,
+ * so the button stays hidden there.
+ *
+ * @param {string} text
+ * @returns {boolean}
+ */
+function isVocabCandidate(text) {
+  const trimmed = (text || "").trim();
+  if (!trimmed || trimmed.length > 60) return false;
+  if (/[.!?;]/.test(trimmed)) return false;
+  const words = trimmed.split(/\s+/);
+  return words.length >= 1 && words.length <= 4;
+}
+
+/**
+ * Finds the transcript sentence containing the selection, so the card carries
+ * the example sentence rather than the bare word.
+ *
+ * @param {string} selectedText
+ * @returns {string} the selection itself when no sentence can be recovered
+ */
+function findSentenceForSelection(selectedText) {
+  const fullText = currentTranscriptText || "";
+  const index = fullText.indexOf(selectedText);
+  if (index === -1) return selectedText;
+
+  const before = fullText.slice(0, index);
+  const start = Math.max(0, before.search(/[^.!?]*$/));
+  const afterIndex = index + selectedText.length;
+  const afterMatch = fullText.slice(afterIndex).match(/^[^.!?]*[.!?]?/);
+  const end = afterIndex + (afterMatch ? afterMatch[0].length : 0);
+
+  const sentence = fullText.slice(start, end).trim();
+  return sentence.length >= selectedText.length ? sentence : selectedText;
+}
+
+/**
+ * Renders the "Add to Vocab" action in the Explain modal footer and wires it to
+ * append a card to the Vocab tab. Reuses normalizeVocabItem so the card gets
+ * the same accurate timestamp resolution as extracted words.
+ *
+ * @param {string} selectedText
+ * @param {{chinese?: string}} result the explanation, for the Chinese gloss
+ */
+function setupAddToVocabButton(selectedText, result) {
+  const footer = document.getElementById("explainFooter");
+  if (!footer || !isVocabCandidate(selectedText)) return;
+
+  const word = selectedText.trim();
+  const existing = (currentVocabItems || []).some(
+    (item) => item.word?.toLowerCase() === word.toLowerCase(),
+  );
+  if (existing) {
+    footer.innerHTML = `<div class="explain-vocab-done">Already in Vocab</div>`;
+    return;
+  }
+
+  footer.innerHTML = `<button class="explain-vocab-btn" id="addToVocabBtn" type="button">+ Add to Vocab</button>`;
+  document.getElementById("addToVocabBtn")?.addEventListener("click", () => {
+    const sentence = findSentenceForSelection(word);
+    const item = normalizeVocabItem(
+      { word, chinese: result?.chinese || "", sentence },
+      new Set(),
+    );
+    if (!item) {
+      footer.innerHTML = `<div class="explain-vocab-done">Could not build a card for this selection</div>`;
+      return;
+    }
+
+    if (!Array.isArray(currentVocabItems)) currentVocabItems = [];
+    currentVocabItems.push(item);
+    currentVocabItems.sort((a, b) => a.timestampSeconds - b.timestampSeconds);
+
+    updateVocabList(currentVocabItems);
+    const tab = document.getElementById("vocabTab");
+    if (tab) tab.textContent = `Vocab (${currentVocabItems.length})`;
+    const findBtn = document.getElementById("findVocabBtn");
+    if (findBtn) findBtn.textContent = `Re-extract (${currentVocabItems.length})`;
+    saveSessionState();
+
+    footer.innerHTML = `<div class="explain-vocab-done">Added to Vocab</div>`;
+  });
+}
+
 function getTranscriptContext(selectedText) {
   const fullText = currentTranscriptText || "";
   const index = fullText.indexOf(selectedText);
@@ -2624,6 +2825,7 @@ async function saveSessionState() {
         version: SESSION_STATE_VERSION,
         tabId: currentOwnerTabId,
         videoId: currentVideoId,
+        transcriptMode: currentTranscriptMode,
         translations,
         vocabItems: currentVocabItems || [],
       };
@@ -3082,6 +3284,10 @@ async function handleTranscriptModeChange(mode) {
   if (transcriptScrollObserver) transcriptScrollObserver.disconnect();
   transcriptScrollObserver = null;
   setTranscriptModeButtons(mode);
+  // Persist the mode immediately so a tab/app switch (which can reload the
+  // side panel) restores the user's chosen view instead of falling back to
+  // the original-language default.
+  saveSessionState();
 
   if (mode === "original") {
     renderTranscript();
@@ -3473,4 +3679,6 @@ globalThis.__YTD_TRANSCRIPT_TESTING__ = {
   normalizeGlossSenses,
   fetchGlossBatch,
   buildVocabCardItems,
+  isVocabCandidate,
+  findSentenceForSelection,
 };

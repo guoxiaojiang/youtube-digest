@@ -19,6 +19,18 @@ const DEBUG = false;
 const AI_PROVIDER_IDLE_TIMEOUT_MS = 50_000;
 const AI_PROVIDER_HARD_TIMEOUT_MS = 120_000;
 const AI_PROVIDER_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+// Non-streaming requests send no body bytes until the whole completion is
+// ready, so their idle bound is really a time-to-first-byte bound. Streaming
+// requests are different: tokens arrive every few hundred ms once generation
+// starts, so silence there is a genuinely dead connection and the bound can be
+// tight. What stays long is the wait BEFORE the first token, while the provider
+// reads a whole transcript — that gets its own budget.
+const AI_STREAM_FIRST_TOKEN_TIMEOUT_MS = 120_000;
+const AI_STREAM_IDLE_TIMEOUT_MS = 45_000;
+// Analysis reads a whole transcript before emitting anything, so it gets the
+// longest wait for that first token.
+const AI_ANALYSIS_FIRST_TOKEN_TIMEOUT_MS = 180_000;
+const AI_ANALYSIS_HARD_TIMEOUT_MS = 300_000;
 const debugLog = (...args) => {
   if (DEBUG) console.log(...args);
 };
@@ -79,6 +91,9 @@ async function requestAiCompletion({
   responseFormat,
   idleTimeoutMs,
   hardTimeoutMs,
+  stream = false,
+  firstTokenTimeoutMs,
+  onDelta,
 }) {
   const settings = await getSettings();
   if (!settings.aiApiKey) {
@@ -97,14 +112,31 @@ async function requestAiCompletion({
   if (responseFormat) {
     body.response_format = responseFormat;
   }
+  if (stream) {
+    body.stream = true;
+  }
 
-  const idleMs = typeof idleTimeoutMs === "number" ? idleTimeoutMs : AI_PROVIDER_IDLE_TIMEOUT_MS;
+  const idleMs =
+    typeof idleTimeoutMs === "number"
+      ? idleTimeoutMs
+      : stream
+        ? AI_STREAM_IDLE_TIMEOUT_MS
+        : AI_PROVIDER_IDLE_TIMEOUT_MS;
   const hardMs = typeof hardTimeoutMs === "number" ? hardTimeoutMs : AI_PROVIDER_HARD_TIMEOUT_MS;
+  // Waiting for the first token is not the same as stalling mid-answer, so the
+  // two get separate budgets. Non-streaming requests have only the first wait.
+  const firstTokenMs =
+    typeof firstTokenTimeoutMs === "number"
+      ? firstTokenTimeoutMs
+      : stream
+        ? AI_STREAM_FIRST_TOKEN_TIMEOUT_MS
+        : idleMs;
 
   const controller = new AbortController();
   let timeoutKind = "";
   let idleTimeoutId;
   let hardTimeoutId;
+  let sawFirstToken = false;
   const abortForTimeout = (kind) => {
     if (controller.signal.aborted) return;
     timeoutKind = kind;
@@ -112,7 +144,16 @@ async function requestAiCompletion({
   };
   const resetIdleTimeout = () => {
     clearTimeout(idleTimeoutId);
-    idleTimeoutId = setTimeout(() => abortForTimeout("idle"), idleMs);
+    const limit = sawFirstToken ? idleMs : firstTokenMs;
+    const kind = sawFirstToken ? "idle" : "firstToken";
+    idleTimeoutId = setTimeout(() => abortForTimeout(kind), limit);
+  };
+  // The first delta flips the request from "waiting to start" to "streaming",
+  // which tightens the idle bound from here on.
+  const markFirstToken = () => {
+    if (sawFirstToken) return;
+    sawFirstToken = true;
+    resetIdleTimeout();
   };
 
   hardTimeoutId = setTimeout(() => abortForTimeout("hard"), hardMs);
@@ -133,6 +174,22 @@ async function requestAiCompletion({
     // Receiving headers proves the AI provider is still making progress. It
     // may then send blank-line body chunks while a non-streaming request queues.
     resetIdleTimeout();
+
+    // A streamed error still arrives as a normal JSON body, so only take the
+    // SSE path once the provider has accepted the request.
+    if (stream && response.ok) {
+      const text = await readAiStream(response, {
+        onActivity: resetIdleTimeout,
+        onFirstToken: markFirstToken,
+        onDelta,
+      });
+      if (!text.trim()) {
+        const error = new Error("AI returned an empty response.");
+        error.code = "EMPTY_AI_RESPONSE";
+        throw error;
+      }
+      return { text, settings };
+    }
 
     const data = await readBoundedAiResponse(response, resetIdleTimeout);
     if (!response.ok) {
@@ -155,6 +212,13 @@ async function requestAiCompletion({
 
     return { text, settings };
   } catch (error) {
+    if (timeoutKind === "firstToken") {
+      const timeoutError = new Error(
+        `AI request produced no output for ${Math.round(firstTokenMs / 1000)} seconds. Please Retry.`,
+      );
+      timeoutError.code = "AI_IDLE_TIMEOUT";
+      throw timeoutError;
+    }
     if (timeoutKind === "idle") {
       const timeoutError = new Error(
         `AI request was inactive for ${Math.round(idleMs / 1000)} seconds. Please Retry.`,
@@ -174,6 +238,85 @@ async function requestAiCompletion({
     clearTimeout(idleTimeoutId);
     clearTimeout(hardTimeoutId);
   }
+}
+
+/**
+ * Reads an OpenAI-style SSE completion, accumulating content deltas.
+ *
+ * Frames are separated by blank lines and each `data:` line carries one JSON
+ * delta. Deltas are forwarded to onDelta so callers can render partial output,
+ * and the joined text is returned so existing JSON parsing still works.
+ *
+ * @param {Response} response - A streaming fetch response
+ * @param {Object} handlers - { onActivity, onFirstToken, onDelta }
+ * @returns {Promise<string>} The full accumulated completion text
+ */
+async function readAiStream(response, { onActivity, onFirstToken, onDelta }) {
+  const reader = response.body?.getReader?.();
+  if (!reader) {
+    // Providers or test shims without a readable stream still answer with a
+    // whole completion body.
+    const data = await readBoundedAiResponse(response, onActivity);
+    const text = data.choices?.[0]?.message?.content;
+    return typeof text === "string" ? text : "";
+  }
+
+  const decoder = new TextDecoder();
+  let fullText = "";
+  let responseBytes = 0;
+  let sseBuffer = "";
+  let streamError = null;
+
+  const handleFrame = (frame) => {
+    for (const line of frame.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) continue;
+      const payload = trimmed.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      let evt;
+      try {
+        evt = JSON.parse(payload);
+      } catch {
+        continue; // partial or malformed frame
+      }
+      // Some providers report mid-stream failures inside a data frame.
+      if (evt?.error) {
+        streamError = new Error(evt.error.message || "AI stream error.");
+        return;
+      }
+      const delta = evt.choices?.[0]?.delta?.content;
+      if (typeof delta !== "string" || !delta) continue;
+      if (!fullText) onFirstToken?.();
+      fullText += delta;
+      if (typeof onDelta === "function") onDelta(delta, fullText);
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    onActivity();
+    responseBytes += value?.byteLength ?? 0;
+    if (responseBytes > AI_PROVIDER_MAX_RESPONSE_BYTES) {
+      await reader.cancel?.().catch(() => {});
+      const error = new Error("AI response exceeded the 2 MiB limit.");
+      error.code = "AI_RESPONSE_TOO_LARGE";
+      throw error;
+    }
+    sseBuffer += decoder.decode(value, { stream: true });
+    const frames = sseBuffer.split("\n\n");
+    sseBuffer = frames.pop() || "";
+    for (const frame of frames) handleFrame(frame);
+    if (streamError) {
+      await reader.cancel?.().catch(() => {});
+      throw streamError;
+    }
+  }
+  sseBuffer += decoder.decode();
+  if (sseBuffer.trim()) handleFrame(sseBuffer);
+  if (streamError) throw streamError;
+
+  return fullText;
 }
 
 async function readBoundedAiResponse(response, onActivity) {
@@ -338,6 +481,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       message.selectedText,
       message.transcriptContext,
       message.videoTitle,
+      message.requestId,
     )
       .then(sendResponse)
       .catch((err) => sendResponse({ error: err.message }));
@@ -939,6 +1083,9 @@ async function handleAnalyzeTranscript(
     const { text: responseText } = await requestAiCompletion({
       maxTokens: 8192,
       responseFormat: { type: "json_object" },
+      stream: true,
+      firstTokenTimeoutMs: AI_ANALYSIS_FIRST_TOKEN_TIMEOUT_MS,
+      hardTimeoutMs: AI_ANALYSIS_HARD_TIMEOUT_MS,
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
@@ -1018,7 +1165,9 @@ function validateAndFixTimestamps(analysis, maxSeconds) {
       if (seconds === null || !title) return null;
       return {
         title,
+        titleZh: safeString(chapter?.titleZh, 300),
         summary: safeString(chapter?.summary, 1500),
+        summaryZh: safeString(chapter?.summaryZh, 1500),
         timestampSeconds: seconds,
         timestamp: formatTimestamp(seconds),
       };
@@ -1036,6 +1185,7 @@ function validateAndFixTimestamps(analysis, maxSeconds) {
       if (seconds === null || !text) return null;
       return {
         quote: text,
+        quoteZh: safeString(quote?.quoteZh, 3000),
         timestampSeconds: seconds,
         timestamp: formatTimestamp(seconds),
       };
@@ -1370,10 +1520,62 @@ async function handleDeleteNote(noteId) {
   }
 }
 
+const EXPLAIN_CN_MARKER = "@@CN@@";
+const EXPLAIN_EN_MARKER = "@@EN@@";
+
+/**
+ * Splits a streamed explanation into its Chinese and English sections.
+ *
+ * Runs on partial text too, so a marker that has only half arrived must not
+ * leak into the output: anything after a trailing partial marker is dropped
+ * until the marker completes.
+ *
+ * @param {string} text - Full or partial completion text
+ * @returns {{chinese: string, english: string}}
+ */
+function parseExplanation(text) {
+  const raw = typeof text === "string" ? text : "";
+  const cnAt = raw.indexOf(EXPLAIN_CN_MARKER);
+  const enAt = raw.indexOf(EXPLAIN_EN_MARKER);
+
+  // No marker yet: treat what we have as the Chinese section, since the prompt
+  // asks for that first. Keeps the first tokens visible instead of blank.
+  if (cnAt === -1 && enAt === -1) {
+    return { chinese: stripPartialMarker(raw), english: "" };
+  }
+
+  const cnStart = cnAt === -1 ? 0 : cnAt + EXPLAIN_CN_MARKER.length;
+  const chinese =
+    enAt === -1 ? raw.slice(cnStart) : raw.slice(cnStart, Math.max(enAt, cnStart));
+  const english =
+    enAt === -1 ? "" : raw.slice(enAt + EXPLAIN_EN_MARKER.length);
+
+  return {
+    chinese: stripPartialMarker(chinese),
+    english: stripPartialMarker(english),
+  };
+}
+
+/**
+ * Removes a trailing fragment of a marker, e.g. a dangling `@@E`.
+ */
+function stripPartialMarker(text) {
+  return text.replace(/@[@A-Z]*$/, "").trim();
+}
+
+/**
+ * Sends a progress update to the side panel. The panel may be closed, so a
+ * missing receiver is expected and ignored.
+ */
+function broadcastToPanel(message) {
+  chrome.runtime.sendMessage(message).catch(() => {});
+}
+
 async function handleExplainSelection(
   selectedText,
   transcriptContext,
   videoTitle,
+  requestId,
 ) {
   try {
     const settings = await getSettings();
@@ -1404,15 +1606,31 @@ async function handleExplainSelection(
     debugLog("[YouTube Digest] Requesting selection explanation");
     const { text: explanation } = await requestAiCompletion({
       maxTokens: 1024,
+      stream: true,
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
       ],
+      onDelta: (_delta, accumulated) => {
+        // Parsing the accumulated text on every delta means the panel always
+        // gets clean sections, never a half-written marker.
+        broadcastToPanel({
+          action: "explainProgress",
+          requestId,
+          ...parseExplanation(accumulated),
+        });
+      },
     });
 
+    const sections = parseExplanation(explanation);
     return {
       success: true,
-      explanation: explanation.trim(),
+      requestId,
+      ...sections,
+      // Kept so an older side panel still renders something readable.
+      explanation: [sections.chinese, sections.english]
+        .filter(Boolean)
+        .join("\n\n"),
     };
   } catch (error) {
     console.error("Explain selection error:", error);
