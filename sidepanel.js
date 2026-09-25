@@ -1395,9 +1395,195 @@ function switchTab(tabName) {
   // and does nothing until the user clicks it.
 }
 
+// ============================================================
+// OVERVIEW ANALYSIS (sidepanel-side, streamed)
+// ============================================================
+// Runs the AI call directly from the sidepanel instead of the background
+// service worker. This avoids Chrome killing long-running message channels
+// ("The message port closed before a response was received") when the
+// service worker suspends. The SSE stream lets us render chapters and
+// quotes as soon as each complete JSON object arrives, so the user sees
+// progressive results instead of a blank "Loading" until the whole JSON
+// finishes.
+
+const ANALYSIS_MAX_TOKENS = 8192;
+const ANALYSIS_HARD_TIMEOUT_MS = 300_000;
+const ANALYSIS_FIRST_TOKEN_TIMEOUT_MS = 180_000;
+
+// Cached analysis.md content so we don't re-fetch the prompt file on every
+// Overview tab open.
+const analysisPromptCache = { markdown: null };
+
+async function loadAnalysisPromptSection(heading, variables = {}) {
+  if (!analysisPromptCache.markdown) {
+    const response = await fetch(chrome.runtime.getURL("prompts/analysis.md"));
+    if (!response.ok) throw new Error("Could not load prompt file: analysis.md");
+    analysisPromptCache.markdown = await response.text();
+  }
+  const markdown = analysisPromptCache.markdown;
+  const marker = `## ${heading}`;
+  const markerIndex = markdown.indexOf(marker);
+  if (markerIndex === -1)
+    throw new Error(`Prompt section not found: analysis.md#${heading}`);
+  const sectionStart = markerIndex + marker.length;
+  const nextSection = markdown.indexOf("\n## ", sectionStart);
+  const section = markdown.slice(
+    sectionStart,
+    nextSection === -1 ? markdown.length : nextSection,
+  );
+  const fenceMatch = section.match(/```(?:[A-Za-z0-9_-]+)?\n([\s\S]*?)\n```/);
+  if (!fenceMatch)
+    throw new Error(`Prompt section not found: analysis.md#${heading}`);
+  let prompt = fenceMatch[1];
+  for (const [key, value] of Object.entries(variables)) {
+    prompt = prompt.split(`{${key}}`).join(String(value ?? ""));
+  }
+  return prompt;
+}
+
 /**
- * Triggers the LLM analysis (lazy-loaded when user clicks Overview or Quotes tab).
- * This saves tokens by not running analysis until needed.
+ * Extracts complete JSON object literals from a streaming accumulation of
+ * text, scanning inside a named top-level array. Returns the newly parsed
+ * items and the character position up to which we've emitted, so the next
+ * call can resume without re-emitting.
+ *
+ * Works on partial text: an object whose closing brace hasn't arrived yet is
+ * simply skipped, and the caller waits for more deltas.
+ */
+function extractCompletedJsonArrayItems(fullText, arrayName, emittedCharPos) {
+  const items = [];
+  const escapedName = arrayName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const arrayMatch = fullText.match(new RegExp(`"${escapedName}"\\s*:\\s*\\[`));
+  if (!arrayMatch) return { items, newPos: emittedCharPos };
+
+  const arrStart = arrayMatch.index + arrayMatch[0].length;
+  let scan = Math.max(emittedCharPos, arrStart);
+
+  while (scan < fullText.length) {
+    while (scan < fullText.length && /[\s,]/.test(fullText[scan])) scan++;
+    if (scan >= fullText.length) break;
+    if (fullText[scan] === "]") break;
+    if (fullText[scan] !== "{") {
+      scan++;
+      continue;
+    }
+
+    // Walk to the matching closing brace, respecting strings and escapes.
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    let end = -1;
+    for (let i = scan; i < fullText.length; i++) {
+      const c = fullText[i];
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (c === "\\") {
+        escape = true;
+        continue;
+      }
+      if (c === '"') {
+        inString = !inString;
+        continue;
+      }
+      if (inString) continue;
+      if (c === "{") depth++;
+      else if (c === "}") {
+        depth--;
+        if (depth === 0) {
+          end = i;
+          break;
+        }
+      }
+    }
+    if (end === -1) break; // object not yet complete — wait for more data
+
+    const objText = fullText.slice(scan, end + 1);
+    try {
+      items.push(JSON.parse(objText));
+    } catch {
+      // Malformed object literal — skip it.
+    }
+    scan = end + 1;
+    emittedCharPos = scan;
+  }
+
+  return { items, newPos: emittedCharPos };
+}
+
+/**
+ * Sidepanel-side equivalent of background.js validateAndFixTimestamps.
+ * Rebuilds the supported schema from untrusted model output and derives
+ * display timestamps from validated numeric seconds.
+ */
+function validateAnalysisTimestamps(analysis, maxSeconds) {
+  const safeMax =
+    Number.isFinite(Number(maxSeconds)) && Number(maxSeconds) > 0
+      ? Number(maxSeconds)
+      : Number.MAX_SAFE_INTEGER;
+  const formatTimestamp = (seconds) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${mins}:${String(secs).padStart(2, "0")}`;
+  };
+  const safeString = (value, maxLength) =>
+    typeof value === "string" ? value.trim().slice(0, maxLength) : "";
+  const safeSeconds = (value) => {
+    const seconds = Number(value);
+    if (!Number.isFinite(seconds) || seconds < 0 || seconds > safeMax) return null;
+    return Math.floor(seconds);
+  };
+
+  const chapters = (Array.isArray(analysis?.chapters) ? analysis.chapters : [])
+    .slice(0, 100)
+    .map((chapter) => {
+      const seconds = safeSeconds(chapter?.timestampSeconds);
+      const title = safeString(chapter?.title, 300);
+      if (seconds === null || !title) return null;
+      return {
+        title,
+        titleZh: safeString(chapter?.titleZh, 300),
+        summary: safeString(chapter?.summary, 1500),
+        summaryZh: safeString(chapter?.summaryZh, 1500),
+        timestampSeconds: seconds,
+        timestamp: formatTimestamp(seconds),
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.timestampSeconds - b.timestampSeconds);
+
+  const keyQuotes = (Array.isArray(analysis?.keyQuotes) ? analysis.keyQuotes : [])
+    .slice(0, 50)
+    .map((quote) => {
+      const seconds = safeSeconds(quote?.timestampSeconds);
+      const text = safeString(quote?.quote, 3000);
+      if (seconds === null || !text) return null;
+      return {
+        quote: text,
+        quoteZh: safeString(quote?.quoteZh, 3000),
+        timestampSeconds: seconds,
+        timestamp: formatTimestamp(seconds),
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.timestampSeconds - b.timestampSeconds);
+
+  const keyMoments = (Array.isArray(analysis?.keyMoments) ? analysis.keyMoments : [])
+    .map(safeSeconds)
+    .filter((seconds) => seconds !== null)
+    .slice(0, 100);
+
+  return { chapters, keyQuotes, keyMoments };
+}
+
+/**
+ * Triggers the LLM analysis (lazy-loaded when user clicks Overview tab).
+ *
+ * Streams directly from the sidepanel (not via the background service
+ * worker) and renders each chapter/quote as soon as its JSON object
+ * completes. This avoids the MV3 service-worker message-channel timeout
+ * that previously left the Overview tab stuck on "Loading" until it failed.
  */
 async function triggerAnalysis() {
   if (!currentTranscriptTimestamped || isAnalysisLoading || currentAnalysis)
@@ -1405,47 +1591,256 @@ async function triggerAnalysis() {
 
   isAnalysisLoading = true;
 
-  // Show loading indicators in the Overview tab
   const chapterList = document.getElementById("chapterList");
   const quotesList = document.getElementById("quotesList");
-
   if (chapterList)
     chapterList.innerHTML =
-      '<li class="chapter-item" style="color: var(--text-muted); border: none;">Loading chapters...</li>';
+      '<li class="chapter-item" style="color: var(--text-muted); border: none;">Loading chapters…</li>';
   if (quotesList)
     quotesList.innerHTML =
-      '<div class="quote-item" style="color: var(--text-muted); border-left-color: var(--border);">Loading quotes...</div>';
+      '<div class="quote-item" style="color: var(--text-muted); border-left-color: var(--border);">Loading quotes…</div>';
+
+  const controller = new AbortController();
+  const hardTimeoutId = setTimeout(
+    () => controller.abort(),
+    ANALYSIS_HARD_TIMEOUT_MS,
+  );
+  let firstTokenTimeoutId;
+
+  // Accumulated streamed items. We render these incrementally; at the end
+  // we run validateAnalysisTimestamps over the full set and re-render.
+  const streamedChapters = [];
+  const streamedQuotes = [];
+  let chaptersEmittedPos = 0;
+  let quotesEmittedPos = 0;
+  let sawFirstToken = false;
+
+  const renderStreamed = () => {
+    if (!streamedChapters.length && !streamedQuotes.length) return;
+    renderAnalysisResults({
+      chapters: streamedChapters,
+      keyQuotes: streamedQuotes,
+    });
+  };
 
   try {
-    const analysisResult = await chrome.runtime.sendMessage({
-      action: "analyzeTranscript",
-      transcriptText: currentTranscriptTimestamped,
-      videoTitle: currentVideoTitle,
-      channelName: currentChannelName,
-      videoDescription: currentVideoDescription,
-      videoDuration: currentVideoDuration,
-    });
-
-    if (!analysisResult.success) {
-      showAnalysisError(
-        `Analysis failed: ${analysisResult.error || "Unknown error"}`,
-      );
+    // Load settings
+    const stored = await chrome.storage.local.get(YTD_SETTINGS.STORAGE_KEY);
+    const settings = YTD_SETTINGS.normalize(stored[YTD_SETTINGS.STORAGE_KEY]);
+    if (!settings.aiApiKey) {
+      showAnalysisError("TokenDance API key not configured. Open Settings.");
       isAnalysisLoading = false;
       return;
     }
 
-    currentAnalysis = analysisResult.analysis;
+    // Compute duration context (same logic as background.js)
+    let lastTranscriptSeconds = 0;
+    const stampMatches =
+      currentTranscriptTimestamped.match(/\[(\d+):(\d{2})\]/g) || [];
+    if (stampMatches.length) {
+      const last = stampMatches[stampMatches.length - 1].match(
+        /\[(\d+):(\d{2})\]/,
+      );
+      lastTranscriptSeconds = parseInt(last[1]) * 60 + parseInt(last[2]);
+    }
+    const effectiveSeconds = Math.max(
+      Math.floor(currentVideoDuration || 0),
+      lastTranscriptSeconds,
+    );
+    const durationMinutes = Math.floor(effectiveSeconds / 60);
+    const durationSeconds = Math.floor(effectiveSeconds % 60);
+    const durationFormatted = `${durationMinutes}:${String(durationSeconds).padStart(2, "0")}`;
+    const maxTimestampSeconds = effectiveSeconds;
+    const lateThresholdSeconds = Math.floor(effectiveSeconds * 0.75);
+    const lateThreshold = `${Math.floor(lateThresholdSeconds / 60)}:${String(
+      lateThresholdSeconds % 60,
+    ).padStart(2, "0")}`;
+
+    const promptVariables = {
+      durationFormatted,
+      lateThreshold,
+      maxTimestampSeconds,
+      videoTitle: currentVideoTitle || "Unknown",
+      channelName: currentChannelName || "Unknown",
+      videoDescription: currentVideoDescription || "No description available",
+      transcriptText: currentTranscriptTimestamped,
+    };
+    const systemPrompt = await loadAnalysisPromptSection(
+      "System prompt",
+      promptVariables,
+    );
+    const userPrompt = await loadAnalysisPromptSection(
+      "User prompt",
+      promptVariables,
+    );
+
+    firstTokenTimeoutId = setTimeout(
+      () => controller.abort(),
+      ANALYSIS_FIRST_TOKEN_TIMEOUT_MS,
+    );
+
+    const response = await fetch(YTD_SETTINGS.chatCompletionsUrl(), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${settings.aiApiKey}`,
+      },
+      body: JSON.stringify({
+        model: settings.aiModel,
+        max_tokens: ANALYSIS_MAX_TOKENS,
+        temperature: 0.3,
+        stream: true,
+        // Overview is a structured extraction task — no chain-of-thought
+        // needed. Disabling reasoning speeds up the first token substantially.
+        enable_thinking: false,
+        thinking: { type: "disabled" },
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "");
+      throw new Error(`HTTP ${response.status}: ${errText.slice(0, 200)}`);
+    }
+
+    // Stream the SSE response
+    const reader = response.body?.getReader?.();
+    const decoder = new TextDecoder();
+    let fullText = "";
+    let sseBuffer = "";
+
+    if (reader) {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        sseBuffer += decoder.decode(value, { stream: true });
+        const frames = sseBuffer.split("\n\n");
+        sseBuffer = frames.pop() || "";
+        for (const frame of frames) {
+          for (const line of frame.split("\n")) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith("data:")) continue;
+            const payload = trimmed.slice(5).trim();
+            if (!payload || payload === "[DONE]") continue;
+            try {
+              const evt = JSON.parse(payload);
+              const delta = evt.choices?.[0]?.delta?.content;
+              if (typeof delta === "string" && delta) {
+                if (!sawFirstToken) {
+                  sawFirstToken = true;
+                  clearTimeout(firstTokenTimeoutId);
+                }
+                fullText += delta;
+              }
+            } catch {
+              /* ignore malformed frame */
+            }
+          }
+        }
+
+        // Incrementally extract and render completed chapters/quotes
+        const chResult = extractCompletedJsonArrayItems(
+          fullText,
+          "chapters",
+          chaptersEmittedPos,
+        );
+        if (chResult.items.length) {
+          streamedChapters.push(...chResult.items);
+          chaptersEmittedPos = chResult.newPos;
+        }
+        const qResult = extractCompletedJsonArrayItems(
+          fullText,
+          "keyQuotes",
+          quotesEmittedPos,
+        );
+        if (qResult.items.length) {
+          streamedQuotes.push(...qResult.items);
+          quotesEmittedPos = qResult.newPos;
+        }
+        if (chResult.items.length || qResult.items.length) {
+          renderStreamed();
+        }
+      }
+    } else {
+      // Fallback: non-streaming environment — read whole body as JSON.
+      const data = await response.json();
+      fullText = data.choices?.[0]?.message?.content || "";
+    }
+
+    // Final parse: try the full JSON, fall back to loose parsing (strip
+    // fences / prose, isolate outer object, remove trailing commas).
+    let finalAnalysis;
+    try {
+      finalAnalysis = JSON.parse(fullText);
+    } catch {
+      let cleaned = fullText.trim();
+      if (cleaned.startsWith("```")) {
+        cleaned = cleaned
+          .replace(/^```(?:json)?\s*/i, "")
+          .replace(/```\s*$/i, "");
+      }
+      const firstBrace = cleaned.indexOf("{");
+      const lastBrace = cleaned.lastIndexOf("}");
+      if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+        cleaned = cleaned.slice(firstBrace, lastBrace + 1);
+      }
+      try {
+        finalAnalysis = JSON.parse(cleaned);
+      } catch {
+        finalAnalysis = JSON.parse(cleaned.replace(/,(\s*[}\]])/g, "$1"));
+      }
+    }
+
+    // If the final parse gave us more than what we streamed (e.g. the model
+    // emitted chapters after keyQuotes, or the stream was truncated), merge.
+    if (
+      Array.isArray(finalAnalysis?.chapters) &&
+      finalAnalysis.chapters.length > streamedChapters.length
+    ) {
+      streamedChapters.length = 0;
+      streamedChapters.push(...finalAnalysis.chapters);
+    }
+    if (
+      Array.isArray(finalAnalysis?.keyQuotes) &&
+      finalAnalysis.keyQuotes.length > streamedQuotes.length
+    ) {
+      streamedQuotes.length = 0;
+      streamedQuotes.push(...finalAnalysis.keyQuotes);
+    }
+    const keyMoments = Array.isArray(finalAnalysis?.keyMoments)
+      ? finalAnalysis.keyMoments
+      : [];
+
+    const validated = validateAnalysisTimestamps(
+      { chapters: streamedChapters, keyQuotes: streamedQuotes, keyMoments },
+      maxTimestampSeconds,
+    );
+
+    if (!validated.chapters.length && !validated.keyQuotes.length) {
+      throw new Error("AI returned no valid chapters or quotes.");
+    }
+
+    currentAnalysis = validated;
     renderAnalysisResults(currentAnalysis);
     highlightMomentsOnPage(currentAnalysis.keyMoments);
-
-    // Save to cache now that we have analysis
     await saveToCache(currentVideoId);
   } catch (error) {
     console.error("[YouTube Digest Panel] Analysis error:", error);
-    showAnalysisError(`Error: ${error.message}`);
+    const message =
+      error.name === "AbortError"
+        ? "Analysis timed out. The video may be too long — try a shorter video."
+        : `Error: ${error.message}`;
+    showAnalysisError(message);
+  } finally {
+    clearTimeout(hardTimeoutId);
+    clearTimeout(firstTokenTimeoutId);
+    isAnalysisLoading = false;
   }
-
-  isAnalysisLoading = false;
 }
 
 /**
