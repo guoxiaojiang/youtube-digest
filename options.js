@@ -26,6 +26,14 @@ const YTD_OPTIONS = (() => {
       deepseekHelpSuffix: ".",
       privacyNote:
         "When you use AI features, TokenDance receives the video transcript and relevant video context. Review TokenDance's terms and pricing before saving.",
+      jevProvider: "Pause insight (Jev)",
+      jevProviderWarning:
+        "jevtypesafeai.com is not the official Jev provider. If you need the official service, switch the provider before configuring.",
+      jevApiKeyLabel: "Jev API key",
+      jevHelp:
+        "Optional. Jev (TypeSafe) is a decision-only model. When you pause a video it classifies the current passage (new concept, conclusion, detail, or transition), suggests whether to take a note, and flags unfamiliar words. Leave empty to hide the card. ",
+      jevLink: "Create a Jev API key",
+      jevHelpSuffix: ".",
       saveSettings: "Save settings",
       localRemix: "Local remix",
       customizationTitle: "Want to use another AI model?",
@@ -44,7 +52,7 @@ const YTD_OPTIONS = (() => {
       customizationReminder:
         "Before copying, replace [PROVIDER] and [MODEL] with the provider and model you want to use.",
       customizationPrompt:
-        "Customize this local YouTube Digest workspace to use [PROVIDER] with [MODEL]. Work only in the current workspace. Before editing, verify that it contains manifest.json and that the manifest name is YouTube Digest. If verification fails, stop and ask me to open the extracted YouTube Digest project folder in my coding agent. Do not search other folders, edit a guessed copy, assume an installation path, or claim Chrome can reveal the absolute OS source path. Update the provider's API endpoint, request format, and minimum Chrome host permissions. Preserve bring-your-own-key and local Chrome storage. Never put API keys in source code, commits, logs, screenshots, this prompt, or chat; after the code is ready, tell me where to enter the key myself. Keep DeepSeek-only request fields and retry behavior isolated to DeepSeek. Handle provider-specific rules separately so one provider does not affect another. Update README.md, README.zh-CN.md, PRIVACY.md, SECURITY.md, and tests. Run npm test, npm run check, and npm run package. Then explain how to reload the unpacked extension and test it on a real YouTube video.",
+        "Customize this local YouTube Digest workspace to use [PROVIDER] with [MODEL]. Work only in the current workspace. Before editing, verify that it contains manifest.json and that the manifest name is YouTube Digest. If verification fails, stop and ask me to open the extracted YouTube Digest project folder in my coding agent. Do not search other folders, edit a guessed copy, assume an installation path, or claim Chrome can reveal the absolute OS source path. Update the provider's API endpoint, request format, and minimum Chrome host permissions. Preserve bring-your-own-key and local Chrome storage. Never put API keys in source code, commits, logs, screenshots, this prompt, or chat; after the code is ready, tell me where to enter the key myself. Keep DeepSeek-only request fields and retry behavior isolated to DeepSeek. Handle provider-specific rules separately so one provider does not affect another. Update README.md, README.zh-CN.md, PRIVACY.md, SECURITY.md, and tests. Run npm test, npm run check, and npm run package. Then explain how to reload the unpacked extension and test it on a real YouTube video. The Jev API key (settings.jevApiKey - the jv_live_... key used by Pause Insight and the Jev vocabulary judgments) is also bring-your-own-key. Never put it in source code, commits, logs, screenshots, this prompt, or chat. After the code is ready, tell the user where to enter the Jev key in the options page.",
       copyCustomizationPrompt: "Copy edited prompt",
       localData: "Local data",
       localDataHelp:
@@ -95,6 +103,14 @@ const YTD_OPTIONS = (() => {
       deepseekHelpSuffix: "。",
       privacyNote:
         "使用 AI 功能时，TokenDance 会收到视频字幕及相关视频上下文。保存前请查看 TokenDance 的服务条款和价格。",
+      jevProvider: "暂停洞察（Jev）",
+      jevProviderWarning:
+        "当前 jevtypesafeai 并非官方，如需请将供应商修改为官方之后再进行相关配置。",
+      jevApiKeyLabel: "Jev API 密钥",
+      jevHelp:
+        "可选。Jev（TypeSafe）是只做判断的模型。暂停视频时，它会判断当前这段内容属于新概念、核心结论、重要细节还是过渡，提示你是否值得记笔记，并标出其中的生词。留空则隐藏该卡片。",
+      jevLink: "创建 Jev API 密钥",
+      jevHelpSuffix: "。",
       saveSettings: "保存设置",
       localRemix: "本地改造",
       customizationTitle: "想使用其他 AI 模型？",
@@ -112,7 +128,7 @@ const YTD_OPTIONS = (() => {
       customizationReminder:
         "复制前，请先把 [PROVIDER] 和 [MODEL] 替换成你想使用的服务和模型。",
       customizationPrompt:
-        "请把当前本地 YouTube Digest 工作区改为使用 [PROVIDER] 提供的 [MODEL]。只在当前工作区中操作。编辑前，先确认其中包含 manifest.json，且 manifest 中的 name 是 YouTube Digest。如果验证失败，请停止，并让我在编程 Agent 中打开 YouTube Digest 解压后的项目文件夹。不要搜索其他文件夹，不要编辑猜测的副本，不要假设安装路径，也不要声称 Chrome 可以显示操作系统中的绝对源码路径。更新该服务的 API endpoint、请求格式和最少的 Chrome host permissions。保留用户自带密钥模式和 Chrome 本地存储。不要把 API 密钥写入源代码、提交记录、日志、截图、这段提示词或聊天；代码准备好后，请告诉我应该在哪里自行填写密钥。DeepSeek 专用的请求参数和重试逻辑继续只用于 DeepSeek。新服务的专属规则请单独处理，避免相互影响。更新 README.md、README.zh-CN.md、PRIVACY.md、SECURITY.md 和测试。运行 npm test、npm run check 和 npm run package。最后，说明如何重新加载已解压的扩展，并在真实 YouTube 视频上测试。",
+        "请把当前本地 YouTube Digest 工作区改为使用 [PROVIDER] 提供的 [MODEL]。只在当前工作区中操作。编辑前，先确认其中包含 manifest.json，且 manifest 中的 name 是 YouTube Digest。如果验证失败，请停止，并让我在编程 Agent 中打开 YouTube Digest 解压后的项目文件夹。不要搜索其他文件夹，不要编辑猜测的副本，不要假设安装路径，也不要声称 Chrome 可以显示操作系统中的绝对源码路径。更新该服务的 API endpoint、请求格式和最少的 Chrome host permissions。保留用户自带密钥模式和 Chrome 本地存储。不要把 API 密钥写入源代码、提交记录、日志、截图、这段提示词或聊天；代码准备好后，请告诉我应该在哪里自行填写密钥。DeepSeek 专用的请求参数和重试逻辑继续只用于 DeepSeek。新服务的专属规则请单独处理，避免相互影响。更新 README.md、README.zh-CN.md、PRIVACY.md、SECURITY.md 和测试。运行 npm test、npm run check 和 npm run package。最后，说明如何重新加载已解压的扩展，并在真实 YouTube 视频上测试。Jev API 密钥（settings.jevApiKey，暂停洞察和 Jev 生词判断使用的 jv_live_… 密钥）同样由用户自带。不要把它写入源代码、提交记录、日志、截图、这段提示词或聊天。代码准备好后，告诉用户应在设置页的哪个位置填写 Jev 密钥。",
       copyCustomizationPrompt: "复制编辑后的提示词",
       localData: "本地数据",
       localDataHelp:
@@ -350,6 +366,7 @@ const YTD_OPTIONS = (() => {
     const form = doc.getElementById("settingsForm");
     const aiApiKeyInput = doc.getElementById("aiApiKey");
     const supadataApiKeyInput = doc.getElementById("supadataApiKey");
+    const jevApiKeyInput = doc.getElementById("jevApiKey");
     const customizationPrompt = doc.getElementById("customizationPrompt");
     const copyCustomizationPromptBtn = doc.getElementById(
       "copyCustomizationPromptBtn",
@@ -422,6 +439,7 @@ const YTD_OPTIONS = (() => {
 
         aiApiKeyInput.value = settings.aiApiKey;
         supadataApiKeyInput.value = settings.supadataApiKey;
+        if (jevApiKeyInput) jevApiKeyInput.value = settings.jevApiKey;
         if (migration.migrated) {
           await storage.set({ [settingsApi.STORAGE_KEY]: settings });
           setStatus(saveStatus, "migrationWarning");
@@ -447,6 +465,7 @@ const YTD_OPTIONS = (() => {
       const settings = settingsApi.normalize({
         aiApiKey: aiApiKeyInput.value,
         supadataApiKey: supadataApiKeyInput.value,
+        jevApiKey: jevApiKeyInput ? jevApiKeyInput.value : "",
       });
 
       if (!settings.supadataApiKey) {

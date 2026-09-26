@@ -8,7 +8,8 @@
   "host_permissions": [
     "https://www.youtube.com/*",
     "https://api.supadata.ai/*",
-    "https://tokendance.space/*"
+    "https://tokendance.space/*",
+    "https://jevtypesafeai.com/*"
   ],
   "action": {
     "default_title": "Open YouTube Digest",

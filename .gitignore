@@ -8,6 +8,10 @@ config.js
 architecture.excalidraw
 explainer-video/
 
+# One-off local helper scripts & doc drafts
+.jev-note.py
+draft_*/
+
 # Tooling & agent workspaces
 .agents/
 .augment/

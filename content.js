@@ -30,6 +30,8 @@ let ytdDigestButton = null;
 let digestButtonObserver = null;
 let digestButtonReconcileTimer = null;
 let digestButtonResizeListenerAdded = false;
+let pauseListenerAttached = false;
+let pauseInsightLastSentAt = 0;
 
 // ============================================================
 // INITIALIZATION
@@ -54,6 +56,9 @@ function init() {
   // (YouTube is an SPA, so elements appear/disappear as you navigate)
   setupButtonObserver();
   setupDigestButtonResizeListener();
+
+  // Watch for pauses so the side panel can show the pause-insight card.
+  attachPauseInsightListener();
 }
 
 /**
@@ -699,6 +704,43 @@ function showNoteSavedToast(note) {
 }
 
 // ============================================================
+// PAUSE INSIGHT DETECTION
+// ============================================================
+
+/**
+ * Listens for the video being paused and reports it to the side panel, which
+ * classifies the current passage with Jev and shows the pause-insight card.
+ * Debounced: pauses closer than 2 seconds apart collapse into one event, and
+ * the listener only activates on watch pages once the player exists.
+ */
+function attachPauseInsightListener() {
+  if (pauseListenerAttached) return;
+  if (!window.location.pathname.includes("/watch")) return;
+
+  const video = document.querySelector("video.html5-main-video");
+  if (!video) {
+    // YouTube renders the player asynchronously after navigation.
+    setTimeout(attachPauseInsightListener, 500);
+    return;
+  }
+
+  pauseListenerAttached = true;
+  video.addEventListener("pause", () => {
+    const now = Date.now();
+    if (now - pauseInsightLastSentAt < 2000) return;
+    pauseInsightLastSentAt = now;
+    chrome.runtime
+      .sendMessage({
+        action: "pauseDetected",
+        currentTime: Math.floor(video.currentTime || 0),
+      })
+      .catch(() => {
+        // The panel may be closed; the next pause will retry.
+      });
+  });
+}
+
+// ============================================================
 // VIDEO INFO EXTRACTION
 // ============================================================
 
@@ -830,6 +872,10 @@ document.addEventListener("yt-navigate-finish", () => {
     clearInterval(ytdNoteButtonRetryTimer);
     ytdNoteButtonRetryTimer = null;
   }
+
+  // Re-attach the pause listener on the (possibly rebuilt) player element.
+  pauseListenerAttached = false;
+  attachPauseInsightListener();
 
   // Remove any toasts
   const existingToast = document.getElementById("ytd-note-toast");

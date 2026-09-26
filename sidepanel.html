@@ -80,6 +80,22 @@
       <div id="resultsState" style="display: none">
         <!-- TAB: Transcript (default - no LLM required) -->
         <div class="tab-panel active" data-panel="transcript">
+          <!-- Pause insight card (Jev, optional). Shown when the video pauses. -->
+          <div class="pause-insight" id="pauseInsightCard" style="display: none">
+            <button
+              class="pause-insight-close"
+              id="pauseInsightCloseBtn"
+              type="button"
+              aria-label="Dismiss pause insight"
+            >
+              ×
+            </button>
+            <div class="pause-insight-kind" id="pauseInsightKind"></div>
+            <div class="pause-insight-message" id="pauseInsightMessage"></div>
+            <div class="pause-insight-passage" id="pauseInsightPassage"></div>
+            <div class="pause-insight-vocab" id="pauseInsightVocab"></div>
+          </div>
+
           <div class="section">
             <div class="section-header transcript-section-header">
               <div class="transcript-header-main">
@@ -150,6 +166,7 @@
               <div class="vocab-progress-text" id="vocabProgressText">Processing…</div>
             </div>
             <div class="vocab-status" id="vocabStatus"></div>
+            <div class="vocab-picks" id="vocabPicks" style="display: none"></div>
             <div id="vocabList">
               <div class="vocab-cta">
                 <div class="vocab-cta-title">Extract learning words</div>
@@ -234,6 +251,17 @@
         </div>
       </div>
     </div>
+
+    <!-- Pause insight scroll-up button — appears when a pause-insight card
+         is rendered; jumps back to the top so the card is visible -->
+    <button
+      class="pause-insight-goto-btn"
+      id="pauseInsightGotoBtn"
+      style="display: none"
+      title="查看暂停洞察"
+    >
+      ↑ 查看洞察
+    </button>
 
     <!-- Auto-scroll follow button — appears when user scrolls away from playback position -->
     <button

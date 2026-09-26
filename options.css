@@ -90,6 +90,17 @@ h1 {
   letter-spacing: -0.04em;
 }
 
+.jev-provider-note {
+  margin: 6px 0 12px;
+  padding: 8px 12px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: #8a5a1d;
+  background: #fdf3e3;
+  border: 1px solid #f0dcb6;
+  border-radius: 6px;
+}
+
 .lede,
 .help {
   color: var(--muted);

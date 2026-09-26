@@ -12,6 +12,10 @@ var YTD_SETTINGS = (() => {
     aiBaseUrl: "https://tokendance.space/gateway/v1",
     aiModel: "deepseek-v4-flash-0731",
     supadataApiKey: "",
+    // Optional. Jev (TypeSafe) powers the pause-insight card: when the video is
+    // paused it classifies the current passage and flags unfamiliar words.
+    // Without a key the feature stays hidden and never blocks anything.
+    jevApiKey: "",
   });
 
   function isLegacyCustom(input) {
@@ -32,6 +36,8 @@ var YTD_SETTINGS = (() => {
         typeof input.supadataApiKey === "string"
           ? input.supadataApiKey.trim()
           : "",
+      jevApiKey:
+        typeof input.jevApiKey === "string" ? input.jevApiKey.trim() : "",
     };
   }
 

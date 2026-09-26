@@ -37,6 +37,21 @@ let currentVocabItems = null;
 let isVocabLoading = false;
 let explainRequestId = null; // Discards deltas from a superseded Explain request.
 
+// --- Pause insight state (Jev, event-driven) ---
+// The card only fires when the user pauses the video. Dismissed means "hide
+// for this video", debounce collapses rapid pause/play cycles, and in-flight
+// prevents overlapping scans when the user pauses repeatedly.
+let pauseInsightLastShownAt = 0;
+let pauseInsightInFlight = false;
+let pauseInsightDismissed = false;
+
+// --- Jev vocab gate + priority picks state ---
+// vocabGateCache holds the Jev verdict for the currently open Explain modal
+// (null when no verdict has landed). vocabPriorityPicks is the top-5
+// "learn these first" strip rendered above the vocab list after extraction.
+let vocabGateCache = null;
+let vocabPriorityPicks = null;
+
 // --- Translation state ---
 // The public transcript control intentionally supports only the original
 // subtitles, Chinese, and an aligned source + Chinese view.
@@ -308,6 +323,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     loadNotes(filterAll ? null : currentVideoId);
     sendResponse({ success: true });
   }
+  if (message.action === "pauseDetected") {
+    // The content script reports a user-initiated pause; classify the
+    // current passage with Jev and show the pause-insight card.
+    handlePauseInsight(message.currentTime);
+    sendResponse({ success: true });
+  }
   return false;
 });
 
@@ -462,6 +483,24 @@ function setupEventListeners() {
   // since the list innerHTML is rebuilt on every state change.
   document.getElementById("vocabList")?.addEventListener("click", (event) => {
     if (event.target?.id === "findVocabCtaBtn") triggerVocabulary();
+  });
+
+  // Pause insight card — the close button hides it for the rest of this
+  // video so it never nags the user.
+  document.getElementById("pauseInsightCloseBtn")?.addEventListener("click", () => {
+    pauseInsightDismissed = true;
+    hidePauseInsight();
+  });
+  document
+    .getElementById("pauseInsightGotoBtn")
+    ?.addEventListener("click", goToPauseInsightCard);
+
+  // Vocab picks strip — clicking a chip jumps to the sentence in the video.
+  document.getElementById("vocabPicks")?.addEventListener("click", (event) => {
+    const chip = event.target?.closest?.(".vocab-pick-chip");
+    if (chip?.dataset?.seconds) {
+      seekTo(Number(chip.dataset.seconds));
+    }
   });
 }
 
@@ -686,9 +725,11 @@ async function startDigest(videoId, videoUrl) {
   isAnalysisLoading = false;
   currentVocabItems = null;
   isVocabLoading = false;
+  resetPauseInsightUI();
   // Clear any leftover session state from a previous video on this tab.
   clearSessionState(currentOwnerTabId, currentVideoId);
   resetVocabUI();
+  resetVocabPicks();
 
   if (currentVideoTitle || currentChannelName) {
     const videoInfo = document.getElementById("videoInfo");
@@ -2023,6 +2064,9 @@ async function triggerVocabulary() {
   saveSessionState();
   isVocabLoading = false;
   updateVocabExportButton();
+  // One Jev call scores every extracted word; the top picks render as the
+  // "learn these first" strip. Silent on failure.
+  rankVocabPriority(currentVocabItems);
 }
 
 function splitTranscriptForVocab(transcriptText, maxChars) {
@@ -2861,6 +2905,10 @@ async function showExplanation(selectedText) {
   // Get some context around the selection from the transcript
   const transcriptContext = getTranscriptContext(selectedText);
 
+  // Jev vocab gate: in parallel with the explanation, decide whether this
+  // selection is a meaningful unit worth a flashcard. Silent on failure.
+  judgeVocabGate(selectedText, transcriptContext);
+
   // Tags this request so late deltas from an earlier selection are ignored.
   const requestId = `explain-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   explainRequestId = requestId;
@@ -3022,6 +3070,11 @@ function findSentenceForSelection(selectedText) {
 function setupAddToVocabButton(selectedText, result) {
   const footer = document.getElementById("explainFooter");
   if (!footer || !isVocabCandidate(selectedText)) return;
+
+  // If a Jev verdict for this exact selection already landed, respect it:
+  // a "not worth a card" ruling keeps the button hidden.
+  const gate = vocabGateCache;
+  if (gate && gate.text === selectedText && !gate.worthy) return;
 
   const word = selectedText.trim();
   const existing = (currentVocabItems || []).some(
@@ -4058,8 +4111,622 @@ function setTranslatingSpinner(show) {
   if (spinner) spinner.classList.toggle("visible", isTranslating);
 }
 
+
+// ============================================================
+// PAUSE INSIGHT (Jev, event-driven)
+// ============================================================
+// Runs directly from the sidepanel. Fires only when the user pauses the
+// video — the one moment they are actively engaged — and never scans
+// anything proactively. Two parallel Jev calls: one classifies the passage
+// (new concept / conclusion / detail / transition, plus a worth-noting
+// judgment), the other judges which rule-filtered candidate words are worth
+// learning. Without a Jev key the card never appears, and a failed request
+// is silently skipped — the card is a bonus, never an interruption.
+
+const JEV_DECIDE_URL = "https://jevtypesafeai.com/api/v1/decide";
+const JEV_TIMEOUT_MS = 30_000;
+const PAUSE_INSIGHT_DEBOUNCE_MS = 6_000; // collapse rapid pause/play cycles
+const PAUSE_INSIGHT_CTX_WINDOW = 6; // seconds before/after the pause point
+const PAUSE_INSIGHT_MAX_LINES = 6;
+const PAUSE_INSIGHT_MAX_CHARS = 480;
+const PAUSE_INSIGHT_WORD_MIN_LEN = 4;
+const PAUSE_INSIGHT_MAX_CANDIDATES = 20;
+const PAUSE_INSIGHT_WORD_THRESHOLD = 0.6; // calibrated noul probability
+
+// Small closed set of function words + youtube/video chatter. Everything
+// else above the length floor is a candidate for the Jev word judgment.
+const PAUSE_INSIGHT_STOP_WORDS = new Set([
+  "the", "and", "that", "have", "for", "not", "with", "you", "this", "but",
+  "they", "his", "her", "she", "will", "one", "all", "would", "there",
+  "their", "what", "about", "which", "when", "make", "can", "like", "time",
+  "just", "him", "know", "take", "people", "into", "year", "your", "good",
+  "some", "could", "them", "see", "other", "than", "then", "look", "only",
+  "come", "over", "think", "also", "back", "after", "work", "first", "well",
+  "even", "want", "because", "these", "give", "most", "very", "thing", "our",
+  "been", "much", "before", "where", "through", "those", "really", "should",
+  "while", "might", "great", "every", "still", "around", "going", "again",
+  "never", "always", "during", "small", "large", "world", "years", "video",
+  "youtube", "lets", "okay", "right", "gonna", "wanna", "kinda", "sorta",
+  "actually", "basically", "literally", "totally",
+]);
+
+/**
+ * One Jev decision call, per https://jevtypesafeai.com/docs. `questions`
+ * maps a stable name to { type, instructions, criteria }. Never throws for
+ * HTTP-level failures; returns { success, answers?, error?, message? }.
+ */
+async function callJevDecision({ state, questions, signal }) {
+  let apiKey = "";
+  try {
+    const stored = await chrome.storage.local.get(YTD_SETTINGS.STORAGE_KEY);
+    apiKey = YTD_SETTINGS.normalize(stored[YTD_SETTINGS.STORAGE_KEY]).jevApiKey;
+  } catch (err) {
+    return { success: false, error: "SETUP", message: err.message };
+  }
+  if (!apiKey) {
+    return {
+      success: false,
+      error: "NO_JEV_KEY",
+      message: "Jev API key not configured.",
+    };
+  }
+
+  let response;
+  try {
+    response = await fetch(JEV_DECIDE_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({ model: "jev-latest", state, questions }),
+      signal,
+    });
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      return {
+        success: false,
+        error: "TIMEOUT",
+        message: "Jev request timed out.",
+      };
+    }
+    return { success: false, error: "NETWORK", message: err.message };
+  }
+
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    const errorMap = {
+      401: {
+        error: "INVALID_JEV_KEY",
+        message: "Jev API key was rejected. Check it in Settings.",
+      },
+      402: {
+        error: "INSUFFICIENT_CREDITS",
+        message: "Jev credits are exhausted.",
+      },
+      403: {
+        error: "ACCOUNT_DISABLED",
+        message: "The Jev account is not activated.",
+      },
+      429: {
+        error: "RATE_LIMITED",
+        message: "Jev is rate-limiting. Try again shortly.",
+      },
+      502: {
+        error: "JEV_UPSTREAM",
+        message: "Jev's upstream service failed. Try again.",
+      },
+    };
+    const mapped = errorMap[response.status];
+    if (mapped) return { success: false, ...mapped };
+    return {
+      success: false,
+      error: `HTTP_${response.status}`,
+      message: `Jev request failed (${response.status}).`,
+    };
+  }
+
+  try {
+    const data = await response.json();
+    return { success: true, answers: data.answers || {}, usage: data.usage };
+  } catch (err) {
+    return { success: false, error: "BAD_RESPONSE", message: err.message };
+  }
+}
+
+/**
+ * Slices the transcript around the pause point. Pure — exposed for tests.
+ */
+function extractPauseContext(
+  transcript,
+  currentTime,
+  windowSeconds = PAUSE_INSIGHT_CTX_WINDOW,
+) {
+  if (!Array.isArray(transcript) || !transcript.length) {
+    return { lines: [], text: "" };
+  }
+  const t = Number(currentTime) || 0;
+
+  let lines = transcript.filter(
+    (entry) => entry.start >= t - windowSeconds && entry.start <= t + windowSeconds,
+  );
+
+  if (!lines.length) {
+    // Pause fell between captions: anchor to the nearest past line and its
+    // neighbour so the card always has something meaningful to show.
+    const past = [...transcript].reverse().find((entry) => entry.start <= t);
+    const anchorIndex = past ? transcript.indexOf(past) : 0;
+    lines = transcript.slice(Math.max(0, anchorIndex - 1), anchorIndex + 2);
+  }
+
+  lines = lines
+    .filter((entry) => String(entry.text || "").trim())
+    .slice(0, PAUSE_INSIGHT_MAX_LINES);
+
+  const text = lines
+    .map((entry) => String(entry.text).trim())
+    .join(" ")
+    .slice(0, PAUSE_INSIGHT_MAX_CHARS);
+
+  return {
+    lines: lines.map((entry) => ({
+      start: entry.start,
+      text: String(entry.text).trim(),
+    })),
+    text,
+  };
+}
+
+/**
+ * Rule-filtered word candidates: no stop words, no already-learned words, no
+ * very short tokens, deduplicated, bounded. Pure — exposed for tests.
+ */
+function extractCandidateWords(text, learnedWords) {
+  const learned = new Set(
+    (learnedWords || []).map((word) => String(word).toLowerCase()),
+  );
+  const seen = new Set();
+  const candidates = [];
+  const tokens = String(text || "").toLowerCase().match(/[a-z]+(?:'[a-z]+)?/g) || [];
+  for (const token of tokens) {
+    const word = token.replace(/^'+|'+$/g, "");
+    if (word.length < PAUSE_INSIGHT_WORD_MIN_LEN) continue;
+    if (PAUSE_INSIGHT_STOP_WORDS.has(word)) continue;
+    if (learned.has(word)) continue;
+    if (seen.has(word)) continue;
+    seen.add(word);
+    candidates.push(word);
+    if (candidates.length >= PAUSE_INSIGHT_MAX_CANDIDATES) break;
+  }
+  return candidates;
+}
+
+function buildPauseClassifyQuestions() {
+  return {
+    content_type: {
+      type: "choice",
+      instructions: "What role does this passage play in the video?",
+      criteria: {
+        concept: "introduces a new concept, term, or idea",
+        conclusion: "states a core conclusion or key takeaway",
+        detail: "gives an important supporting detail or example",
+        transition: "transition, small talk, or low-content speech",
+      },
+    },
+    worth_note: {
+      type: "noul",
+      instructions: "Is this passage worth writing a study note about?",
+    },
+  };
+}
+
+function buildPauseVocabQuestions(candidates) {
+  const questions = {};
+  candidates.forEach((word, index) => {
+    questions[`w_${index}`] = {
+      type: "noul",
+      instructions: `In this video passage, is the word "${word}" likely unfamiliar to a B1-B2 English learner and worth learning?`,
+    };
+  });
+  return questions;
+}
+
+// Card copy is Chinese except for the quoted transcript passage itself.
+const PAUSE_INSIGHT_KIND_META = Object.freeze({
+  concept: {
+    label: "新概念",
+    message: "新概念 — 建议暂停记一条笔记。",
+  },
+  conclusion: {
+    label: "核心结论",
+    message: "核心结论 — 值得记下来。",
+  },
+  detail: {
+    label: "重要细节",
+    message: "重要细节 — 值得记一笔。",
+  },
+  transition: {
+    label: "过渡",
+    message: "过渡或铺垫 — 可以跳过。",
+  },
+});
+
+/**
+ * Merges the two Jev responses into the card payload. Pure — exposed for
+ * tests. The kind falls back to transition when Jev is uncertain or failed.
+ */
+function summarizePauseInsight(classification, vocabAnswers, candidates) {
+  const kindAnswer = classification?.answers?.content_type;
+  const kind =
+    kindAnswer?.choice && PAUSE_INSIGHT_KIND_META[kindAnswer.choice]
+      ? kindAnswer.choice
+      : "transition";
+  const worthNote =
+    typeof classification?.answers?.worth_note?.noul === "number"
+      ? classification.answers.worth_note.noul >= 0.5
+      : false;
+
+  const meta = PAUSE_INSIGHT_KIND_META[kind];
+  let message = meta.message;
+  if (kind === "transition" && worthNote) {
+    message = "过渡内容，但这部分似乎重要 — 也许值得快速记一笔。";
+  }
+  if (kind !== "transition" && !worthNote) {
+    message = `${meta.message}（内容较轻 — 对你有价值再记。）`;
+  }
+
+  const words = [];
+  (candidates || []).forEach((word, index) => {
+    const answer = vocabAnswers?.answers?.[`w_${index}`];
+    const probability = typeof answer?.noul === "number" ? answer.noul : 0;
+    if (probability >= PAUSE_INSIGHT_WORD_THRESHOLD) {
+      words.push({ word, probability });
+    }
+  });
+
+  return { kind, message, worthNote, words };
+}
+
+function readJevSettings() {
+  return chrome.storage.local
+    .get(YTD_SETTINGS.STORAGE_KEY)
+    .then((stored) => YTD_SETTINGS.normalize(stored[YTD_SETTINGS.STORAGE_KEY]))
+    .catch(() => null);
+}
+
+function learnedWordsFromState() {
+  if (!Array.isArray(currentVocabItems)) return [];
+  return currentVocabItems.map((item) => item.word).filter(Boolean);
+}
+
+/**
+ * Entry point for a pause event: guards, builds context, runs two parallel
+ * Jev calls, renders the card. Every guard and failure path is silent — the
+ * card is a bonus, never an interruption.
+ */
+async function handlePauseInsight(currentTime) {
+  const now = Date.now();
+  if (now - pauseInsightLastShownAt < PAUSE_INSIGHT_DEBOUNCE_MS) return;
+  if (pauseInsightInFlight) return;
+  if (pauseInsightDismissed) return;
+  if (!currentTranscript || !currentTranscript.length) return;
+
+  const settings = await readJevSettings();
+  if (!settings?.jevApiKey) return;
+
+  pauseInsightInFlight = true;
+  // The pill appears the moment the user pauses (once all guards pass), not
+  // when the Jev response lands, so there is always an affordance pointing
+  // at the card area.
+  showPauseInsightGotoBtn();
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), JEV_TIMEOUT_MS);
+
+  try {
+    const context = extractPauseContext(currentTranscript, currentTime);
+    if (!context.text) return;
+
+    const candidates = extractCandidateWords(
+      context.text,
+      learnedWordsFromState(),
+    );
+    const state = {
+      video_title: currentVideoTitle || "",
+      passage: context.text,
+    };
+
+    const [classification, vocabResult] = await Promise.all([
+      callJevDecision({
+        state,
+        questions: buildPauseClassifyQuestions(),
+        signal: controller.signal,
+      }),
+      candidates.length
+        ? callJevDecision({
+            state,
+            questions: buildPauseVocabQuestions(candidates),
+            signal: controller.signal,
+          })
+        : Promise.resolve({ success: true, answers: {} }),
+    ]);
+
+    if (!classification.success) return;
+
+    const insight = summarizePauseInsight(
+      classification,
+      vocabResult,
+      candidates,
+    );
+    renderPauseInsight(insight, context);
+    pauseInsightLastShownAt = Date.now();
+  } catch (_err) {
+    // Never surface card failures to the user; the next pause retries.
+  } finally {
+    clearTimeout(timeoutId);
+    pauseInsightInFlight = false;
+  }
+}
+
+function renderPauseInsight(insight, context) {
+  const card = document.getElementById("pauseInsightCard");
+  if (!card) return;
+  const kind = document.getElementById("pauseInsightKind");
+  const message = document.getElementById("pauseInsightMessage");
+  const passage = document.getElementById("pauseInsightPassage");
+  const vocab = document.getElementById("pauseInsightVocab");
+  if (!kind || !message || !passage || !vocab) return;
+
+  const meta = PAUSE_INSIGHT_KIND_META[insight.kind];
+  kind.textContent = meta.label;
+  kind.className = `pause-insight-kind pause-insight-kind--${insight.kind}`;
+  message.textContent = insight.message;
+  passage.textContent = context.text;
+
+  vocab.innerHTML = "";
+  if (insight.words.length) {
+    const label = document.createElement("div");
+    label.className = "pause-insight-vocab-label";
+    label.textContent = "值得学习的生词";
+    vocab.appendChild(label);
+    insight.words.forEach(({ word, probability }) => {
+      const chip = document.createElement("span");
+      chip.className = "pause-insight-word";
+      chip.textContent = word;
+      chip.title = `约 ${Math.round(probability * 100)}% 概率为生词，点击查看解释`;
+      chip.tabIndex = 0;
+      // Reuse the transcript explain modal — the word came from the paused
+      // passage, so showExplanation finds its surroundings in the transcript.
+      chip.addEventListener("click", () => showExplanation(word));
+      chip.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          showExplanation(word);
+        }
+      });
+      vocab.appendChild(chip);
+    });
+  }
+
+  card.style.display = "";
+}
+
+function hidePauseInsight() {
+  const card = document.getElementById("pauseInsightCard");
+  if (card) card.style.display = "none";
+  hidePauseInsightGotoBtn();
+}
+
+function showPauseInsightGotoBtn() {
+  const button = document.getElementById("pauseInsightGotoBtn");
+  if (button) button.style.display = "";
+}
+
+function hidePauseInsightGotoBtn() {
+  const button = document.getElementById("pauseInsightGotoBtn");
+  if (button) button.style.display = "none";
+}
+
+function goToPauseInsightCard() {
+  // The card lives at the top of the Transcript tab; jump there and scroll
+  // the content area to the top so the card is actually visible.
+  switchTab("transcript");
+  // Drop auto-follow first: playback ticks would otherwise re-anchor the
+  // view to the paused line and fight the scroll up. The follow-playback
+  // pill appears so the user can re-engage following with one click.
+  autoScrollEnabled = false;
+  syncFollowPlaybackButton();
+  const content = document.getElementById("contentArea");
+  if (content) {
+    content.scrollTo({ top: 0, behavior: "smooth" });
+    // Transcript rows can reflow while translations stream in or the panel
+    // re-renders; settle at the top again a moment later.
+    setTimeout(() => {
+      if (content.scrollTop > 2) {
+        content.scrollTo({ top: 0, behavior: "smooth" });
+      }
+    }, 400);
+  }
+  hidePauseInsightGotoBtn();
+}
+
+function resetPauseInsightUI() {
+  pauseInsightDismissed = false;
+  hidePauseInsight();
+}
+
+
+// ============================================================
+// JEV VOCAB GATE + PRIORITY PICKS
+// ============================================================
+// Two event-driven Jev judgments that replace rule heuristics:
+//  1. Vocab gate — when the user explains a selection, Jev decides whether
+//     the selected text is a meaningful unit worth a flashcard (noul). The
+//     rule-based isVocabCandidate still runs first as a free pre-filter;
+//     Jev refines it, and the Add-to-Vocab button is retracted on a "no".
+//  2. Priority picks — after vocabulary extraction finishes, one Jev call
+//     scores every word (noul) and the top five render as a "learn these
+//     first" strip. Both are silent on failure: the feature degrades to the
+//     previous rule-based behavior.
+
+const VOCAB_GATE_THRESHOLD = 0.5;
+const VOCAB_PICKS_COUNT = 5;
+const VOCAB_PICKS_THRESHOLD = 0.55;
+
+/**
+ * Jev verdict on whether a selection is a good vocabulary-learning unit.
+ * Fires only while the Explain modal is open (a user intent moment). Runs the
+ * free rule check first; without a Jev key the button keeps its rule-based
+ * behavior.
+ */
+async function judgeVocabGate(selectedText, context) {
+  vocabGateCache = null;
+  if (!isVocabCandidate(selectedText)) return;
+
+  const settings = await readJevSettings();
+  if (!settings?.jevApiKey) return;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), JEV_TIMEOUT_MS);
+  try {
+    const result = await callJevDecision({
+      state: {
+        video_title: currentVideoTitle || "",
+        selected_text: selectedText,
+        passage: String(context || ""),
+      },
+      questions: {
+        worth_card: {
+          type: "noul",
+          instructions:
+            "For a B1-B2 English learner, is this selected text a meaningful, well-formed vocabulary-learning unit worth making a flashcard for? A good unit is a word or short phrase with one clear headword; a whole sentence, a broken fragment, or a string of function words is not.",
+        },
+      },
+      signal: controller.signal,
+    });
+
+    const noul = result.answers?.worth_card?.noul;
+    if (typeof noul !== "number") return;
+    vocabGateCache = { text: selectedText, worthy: noul >= VOCAB_GATE_THRESHOLD };
+
+    // If the verdict lands while the modal is open with the button visible,
+    // retract the button quietly instead of offering a useless card.
+    if (!vocabGateCache.worthy) {
+      const footer = document.getElementById("explainFooter");
+      const button = document.getElementById("addToVocabBtn");
+      if (footer && button) footer.innerHTML = "";
+    }
+  } catch (_err) {
+    // Silent: fall back to the rule-based behavior.
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+/**
+ * Merges Jev's per-word noul answers into the top picks. Pure — exposed for
+ * tests.
+ */
+function summarizeVocabPicks(decisionResult, items) {
+  const scored = [];
+  (items || []).forEach((item, index) => {
+    const answer = decisionResult?.answers?.[`p_${index}`];
+    const priority = typeof answer?.noul === "number" ? answer.noul : 0;
+    if (priority >= VOCAB_PICKS_THRESHOLD) {
+      scored.push({
+        word: item.word,
+        chinese: item.chinese || "",
+        priority,
+        timestampSeconds: item.timestampSeconds,
+      });
+    }
+  });
+  scored.sort((a, b) => b.priority - a.priority);
+  return scored.slice(0, VOCAB_PICKS_COUNT);
+}
+
+/**
+ * One Jev call scoring every extracted word, then renders the picks strip.
+ * Called once per finished extraction — not per word or per render.
+ */
+async function rankVocabPriority(items) {
+  if (!Array.isArray(items) || !items.length) return;
+  const settings = await readJevSettings();
+  if (!settings?.jevApiKey) return;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), JEV_TIMEOUT_MS);
+  try {
+    const questions = {};
+    items.forEach((item, index) => {
+      questions[`p_${index}`] = {
+        type: "noul",
+        instructions: `For a B1-B2 English learner studying with videos, how worth prioritizing is the word "${item.word}"? Favor words common enough to reappear in everyday speech or study material, but not so basic that the learner already knows them.`,
+      };
+    });
+    const result = await callJevDecision({
+      state: {
+        video_title: currentVideoTitle || "",
+        words: items.map((item) => item.word),
+      },
+      questions,
+      signal: controller.signal,
+    });
+    if (!result.success) return;
+    vocabPriorityPicks = summarizeVocabPicks(result, items);
+    renderVocabPicks();
+  } catch (_err) {
+    // Silent: no picks strip when Jev is unavailable.
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function renderVocabPicks() {
+  const container = document.getElementById("vocabPicks");
+  if (!container) return;
+  if (!vocabPriorityPicks || !vocabPriorityPicks.length) {
+    container.style.display = "none";
+    return;
+  }
+  const chips = vocabPriorityPicks
+    .map((pick) => {
+      const word = escapeHtml(pick.word);
+      const chinese = pick.chinese ? ` · ${escapeHtml(pick.chinese)}` : "";
+      const pct = Math.round(pick.priority * 100);
+      return `<span class="vocab-pick-chip" data-seconds="${pick.timestampSeconds}" title="约 ${pct}% 值得优先学">${word}${chinese}</span>`;
+    })
+    .join("");
+  container.innerHTML = `
+    <div class="vocab-picks-title">Today's picks · 今天先学这 5 个</div>
+    <div class="vocab-picks-chips">${chips}</div>
+  `;
+  container.style.display = "";
+}
+
+function resetVocabPicks() {
+  vocabPriorityPicks = null;
+  const container = document.getElementById("vocabPicks");
+  if (container) container.style.display = "none";
+}
+
 // Pure helpers are exposed for the repository's Node tests. The extension does
 // not read this object at runtime.
+globalThis.__YTD_PAUSE_INSIGHT_TESTING__ = {
+  callJevDecision,
+  extractPauseContext,
+  extractCandidateWords,
+  buildPauseClassifyQuestions,
+  buildPauseVocabQuestions,
+  summarizePauseInsight,
+};
+
+globalThis.__YTD_JEV_VOCAB_TESTING__ = {
+  judgeVocabGate,
+  rankVocabPriority,
+  summarizeVocabPicks,
+  isVocabCandidate,
+};
+
 globalThis.__YTD_TRANSCRIPT_TESTING__ = {
   sendTranslationMessage,
   groupTranscriptEntries,
